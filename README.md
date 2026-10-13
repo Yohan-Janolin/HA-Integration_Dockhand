@@ -3,7 +3,9 @@
 [![Validation](https://img.shields.io/github/actions/workflow/status/raetha/ha-dockhand/ci.yml?label=validation&style=for-the-badge)](https://github.com/raetha/ha-dockhand/actions/workflows/ci.yml)
 [![Installs](https://img.shields.io/badge/dynamic/json?style=for-the-badge&color=blue&label=installs&cacheSeconds=3600&url=https://analytics.home-assistant.io/custom_integrations.json&query=$.dockhand.total)](https://analytics.home-assistant.io/custom_integrations.json)
 
-![Dockhand logo](custom_components/dockhand/brand/logo.png)
+<p align="center">
+  <img src="custom_components/dockhand/brand/logo.png" alt="Dockhand logo">
+</p>
 
 # Dockhand for Home Assistant
 
@@ -11,7 +13,7 @@ Monitor and control your Docker environments through **[Dockhand](https://dockha
 
 No cloud services are used. Supports **API token authentication** and works with Dockhand instances where authentication is disabled.
 
-Want dashboard cards, not just entities? See **[ha-dockhand-cards](https://github.com/raetha/ha-dockhand-cards)** — Lovelace cards modeled on Dockhand's own UI (environment, environment overview, vulnerability, stack, and container cards), built on top of the entities this integration provides.
+Want dashboard cards, not just entities? See **[ha-dockhand-cards](https://github.com/raetha/ha-dockhand-cards)** — nine Lovelace cards modeled on Dockhand's own UI (environments, stacks, containers, pending updates, vulnerabilities, schedules, and a whole-dashboard overview), built on top of the entities this integration provides.
 
 ---
 

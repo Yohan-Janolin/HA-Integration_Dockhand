@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Internal
+
+- The README's logo is now centered, matching the ha-dockhand-cards README, and its pointer to
+  ha-dockhand-cards lists all nine cards instead of the original five.
+
 ## [1.10.2] — 2026-09-24
 
 ### Added
