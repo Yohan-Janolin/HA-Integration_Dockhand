@@ -31,6 +31,27 @@
       "container_block_write": {
         "default": "mdi:harddisk"
       },
+      "stack_cpu_percent": {
+        "default": "mdi:cpu-64-bit"
+      },
+      "stack_memory_usage": {
+        "default": "mdi:memory"
+      },
+      "stack_memory_limit": {
+        "default": "mdi:memory-arrow-down"
+      },
+      "stack_network_rx": {
+        "default": "mdi:download-network"
+      },
+      "stack_network_tx": {
+        "default": "mdi:upload-network"
+      },
+      "stack_block_read": {
+        "default": "mdi:harddisk"
+      },
+      "stack_block_write": {
+        "default": "mdi:harddisk"
+      },
       "containers": {
         "default": "mdi:docker"
       },

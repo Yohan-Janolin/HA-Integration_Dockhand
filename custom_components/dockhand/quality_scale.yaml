@@ -11,7 +11,7 @@ rules:
     comment: >
       All three coordinators use DataUpdateCoordinator with user-configurable
       intervals. Fast coordinator defaults to 60 s (stats, containers, stacks,
-      container resource stats, pending-update flags); slow coordinator
+      container and stack resource stats, pending-update flags); slow coordinator
       defaults to 600 s (images, volumes, networks, schedules, git stacks,
       host info, container auto-update settings, runtime controls, and
       env_meta — the handful of fields only /api/environments has: image-prune
@@ -22,7 +22,8 @@ rules:
       single API call per fast poll cycle rather than one call per environment.
       Container resource stats are fetched via a single bulk API call per
       environment (GET /api/containers/stats?env=N) rather than one call per
-      container.
+      container, and stack totals the same way (GET /api/stack-stats?env=N,
+      feature-detected — Dockhand 1.0.52+).
 
   brands:
     status: done
@@ -32,28 +33,25 @@ rules:
   common-modules:
     status: done
     comment: >
-      helpers.py is the single source of truth for shared URL helpers
-      (_env_url, _container_url, _stack_url, etc.), DeviceInfo factory
-      functions (_env_device, _container_device, _stack_device, _sched_device,
-      etc.), device registration (_ensure_env_devices, _ensure_hub_devices),
-      and utility helpers (_compose_project, _container_has_healthcheck).
-      coordinator.py contains all DataUpdateCoordinator subclasses. All
-      async_get_or_create calls are consolidated in helpers.py so device
-      attributes are always consistent regardless of which call path runs first.
+      The coordinators are in coordinator.py and the shared base entities in
+      entity.py (environment-, container- and stack-scoped, each with its own
+      device and data lookup); the platform modules subclass those. helpers.py
+      holds the rest of what several modules share: URL builders, DeviceInfo
+      factories, device registration, and the per-resource lookups used by
+      entities on the slow coordinator.
 
   config-flow:
     status: done
     comment: >
       Full UI config flow: async_step_user (URL and SSL), async_step_token
-      (shown only when server returns 401), async_step_setup_options (poll
-      intervals and feature flags, presented during initial setup so users
-      configure everything upfront), async_step_reauth_confirm,
-      async_step_reconfigure (URL, SSL, token only — options via Configure),
-      and options flow. Auth is auto-detected — no checkbox needed. All steps
-      include data_description for each field. Connection steps include a
-      verify_ssl checkbox (default: True) to support self-signed certs.
-      Poll interval fields enforce sane minimums to reject zero/negative
-      values that would cause tight-loop polling.
+      (shown only when the server returns 401), async_step_setup_options (poll
+      intervals and feature flags, so everything is set up front),
+      async_step_reauth_confirm, async_step_reconfigure (URL, SSL, token), and
+      an options flow. Every field has a data_description. entry.data holds
+      only the connection details; everything the options flow sets lives in
+      entry.options (settings older releases stored in entry.data are moved
+      by the schema migration). Poll interval fields enforce minimums, and the
+      token field uses a password TextSelector.
 
   config-flow-test-coverage:
     status: done
@@ -77,6 +75,11 @@ rules:
     comment: >
       No custom service actions registered.
 
+  docs-conditions:
+    status: exempt
+    comment: >
+      The integration registers no automation conditions.
+
   docs-high-level-description:
     status: done
     comment: >
@@ -94,6 +97,11 @@ rules:
     comment: >
       README has a Removal section describing how to delete via the HA UI and
       uninstall via HACS.
+
+  docs-triggers:
+    status: exempt
+    comment: >
+      The integration registers no automation triggers.
 
   entity-event-setup:
     status: exempt
@@ -120,12 +128,11 @@ rules:
   runtime-data:
     status: done
     comment: >
-      DockhandData dataclass is stored on entry.runtime_data. Contains client,
-      fast_coordinator, slow_coordinator, and update_coordinator (None unless
-      "Enable precise update versions" is on — the update platform itself is
-      always active; this only controls the optional real-registry-query
-      tier layered on top of it). Typed alias DockhandConfigEntry used
-      throughout so runtime_data is typed without casting.
+      DockhandData (client, the fast and slow coordinators, the update
+      coordinator when precise update versions are on, and per-setup entity
+      bookkeeping) is stored on entry.runtime_data. The DockhandConfigEntry
+      alias is used for every entry argument, the options flow included, so
+      runtime_data is typed without casting.
 
   test-before-configure:
     status: done
@@ -155,9 +162,16 @@ rules:
   # ── Silver ────────────────────────────────────────────────────────────────
 
   action-exceptions:
-    status: exempt
+    status: done
     comment: >
-      No custom service actions registered.
+      The integration registers no service actions of its own, but the rule
+      also covers platform actions, and it has those: buttons (restart,
+      redeploy, git deploy, check for updates, update all), switches
+      (container and stack running, auto update, git auto deploy), numbers
+      and the select (runtime controls), and update install. Every one raises
+      HomeAssistantError with a translation key when the action fails
+      (action_failed, carrying Dockhand's error) or its container or git
+      stack is gone (container_not_found, git_stack_not_found).
 
   config-entry-unloading:
     status: done
@@ -168,13 +182,11 @@ rules:
   docs-configuration-parameters:
     status: done
     comment: >
-      README "Configuration parameters" section documents all fields: API URL,
-      API token (when auth is enabled), fast poll interval, slow poll interval,
-      the optional feature flags (schedules, images, volumes, networks,
-      precise update versions, runtime controls, container stats), update
-      check interval, and SSL verification. Separate subsections cover
-      setup-time fields, the Options flow (adjustable via Configure), and
-      Reconfigure (for changing URL/token).
+      README "Configuration parameters" documents every setup field (API URL,
+      SSL verification, API token) and every option (fast and slow poll
+      intervals, the schedules/images/volumes/networks switches, update
+      entities, precise update versions and their check interval, runtime
+      controls, container and stack stats), plus what Reconfigure changes.
 
   docs-installation-parameters:
     status: done
@@ -185,10 +197,13 @@ rules:
   entity-unavailable:
     status: done
     comment: >
-      All entities inherit CoordinatorEntity. When a coordinator update fails,
-      HA automatically marks all its entities unavailable. Entities that depend
-      on optional data (e.g. health sensor) additionally return None when their
-      specific data is absent.
+      All entities are CoordinatorEntity, so a failed poll makes that
+      coordinator's entities unavailable. Where only part of a poll fails (one
+      environment, or one optional fetch, recorded in fetch_failures), the
+      entities depending on that part also report unavailable, and every
+      `available` override starts from super().available. Entities whose
+      container or stack has gone report unavailable until cleanup removes
+      them.
 
   integration-owner:
     status: done
@@ -205,10 +220,13 @@ rules:
   parallel-updates:
     status: done
     comment: >
-      PARALLEL_UPDATES = 0 set in every platform file (sensor.py,
-      binary_sensor.py, switch.py, button.py, update.py, number.py,
-      select.py). Coordinator-based platforms use 0 to indicate updates are
-      managed by the coordinator.
+      PARALLEL_UPDATES = 0 in every platform. Reads all go through the
+      coordinators. For the action platforms (button, switch, number, select,
+      update), each action is one request to Dockhand, which queues Docker
+      work itself and handles concurrent requests the same way its own UI
+      sends them; container updates go through its batch-update job API.
+      Serializing them in Home Assistant would only slow down a script that
+      starts several containers, without protecting anything.
 
   reauthentication-flow:
     status: done
@@ -221,17 +239,13 @@ rules:
   test-coverage:
     status: done
     comment: >
-      Comprehensive pure-pytest suite covering the API client, config and
-      options flows (including interval validation), all coordinators, all
-      entity classes and platforms, device registration and cleanup,
-      migrations (device/entity registry and config-entry schema),
-      system-container protection, repair issue creation, diagnostics
-      redaction, and setup/unload. CI is authoritative for test counts and
-      results. The full suite requires Python 3.14.2+ and PHCC; the Claude
-      sandbox provisions this via `uv python install 3.14` (prebuilt
-      CPython, seconds not minutes) rather than compiling from source, so
-      the full suite runs in-sandbox routinely rather than being deferred
-      to CI. See docs/development.md for the sandbox setup.
+      Pytest suite (pytest-homeassistant-custom-component) covering the API
+      client, config and options flows, coordinators, every platform and
+      entity class, device registration and cleanup, manual device removal,
+      registry and config-entry migrations (including downgrades), system
+      container protection, repair issues, diagnostics redaction, and
+      setup/unload. Every line is covered, and scripts/run_tests.sh --full
+      and CI both fail if one isn't (pytest --cov-fail-under=100).
 
   # ── Gold ──────────────────────────────────────────────────────────────────
 
@@ -276,27 +290,37 @@ rules:
   docs-data-update:
     status: done
     comment: >
-      README has a Data Updates section explaining the three-coordinator model:
-      what each coordinator fetches, default intervals, how failures are handled,
-      and how token errors surface as re-authentication prompts.
+      README "Data Updates" explains the three coordinators (what each fetches,
+      default and minimum intervals), that nothing is pushed so changes appear
+      on the next fast poll, the load lower intervals put on Dockhand and the
+      Docker hosts, what becomes unavailable when all or part of a poll fails,
+      and how token errors surface as re-authentication.
 
   docs-examples:
     status: done
     comment: >
-      README includes a complete automation example triggered by container
-      state change.
+      README "Example automations" has several ready-to-adapt YAML examples:
+      notify when a container stops, restart a container that stays unhealthy,
+      and notify when a Docker host goes offline.
 
   docs-known-limitations:
     status: done
     comment: >
-      README documents the minimum Dockhand version required for token
-      authentication (≥ 1.0.26) and that no-auth installs are unaffected.
+      README "Known limitations" lists what the integration can't do and why:
+      polling only, read-only schedules, restart needing a running container,
+      runtime controls only for stand-alone containers, no controls for system
+      containers, Install not moving to a newer version tag, no updates for
+      digest-pinned images, git stack deploy
+      following the stack's own repull setting, stats only for running
+      containers, and hidden containers. "Requirements" covers which features
+      need which Dockhand version.
 
   docs-supported-devices:
     status: done
     comment: >
-      README describes Dockhand as the supported service and links to the
-      Dockhand project.
+      README describes Dockhand (with a link) as the supported service, and
+      "Requirements" gives the Home Assistant and Dockhand versions needed,
+      including which features need a newer Dockhand.
 
   docs-supported-functions:
     status: done
@@ -308,15 +332,17 @@ rules:
   docs-troubleshooting:
     status: done
     comment: >
-      README has a Troubleshooting section covering connection errors, auth
-      failures, session expiry, unavailable entities, and missing compose
-      labels.
+      README "Troubleshooting" covers connection errors, entity IDs with a
+      suffix after an update, no entities after setup, leftover devices and
+      how to delete them, and why schedules have no run button. Authentication
+      problems are covered under "Re-authentication".
 
   docs-use-cases:
     status: done
     comment: >
-      README includes an automation example illustrating a real use case:
-      alerting when a container stops unexpectedly.
+      README "Use cases" describes what people use the integration for:
+      outage alerts, automatic recovery, update management, resource history,
+      and dashboards (with the companion card library).
 
   dynamic-devices:
     status: done
@@ -337,8 +363,9 @@ rules:
     status: done
     comment: >
       EntityCategory.DIAGNOSTIC applied to all monitoring and config-mirror
-      entities, including the container resource stats sensors (CPU usage,
-      memory usage, memory usage %, memory limit, network in/out, disk read/write).
+      entities, including the container and stack resource stats sensors (CPU
+      usage, memory usage, memory usage %, memory limit, network in/out, disk
+      read/write).
       EntityCategory.CONFIG applied to Restart buttons (user-initiated device
       control actions). Primary state sensors (Container State, Stack Status) and
       Running switches have no category as they are primary control and observation
@@ -348,7 +375,7 @@ rules:
     status: done
     comment: >
       SensorDeviceClass.DATA_SIZE used for the disk usage sensor and the
-      container resource stats sensors (memory usage,
+      container and stack resource stats sensors (memory usage,
       memory limit, network in/out, disk read/write). SensorDeviceClass.TIMESTAMP
       used for the schedule next-run sensor. BinarySensorDeviceClass.CONNECTIVITY
       used for the environment Online sensor. All other sensors and binary sensors
@@ -374,7 +401,7 @@ rules:
       Note: the container resource stats sensors (CPU usage, memory usage,
       memory usage %, memory limit, network in, network out, disk read,
       disk write) are a stronger case than "disabled by default" — they
-      are not created at all unless "Enable container stats" is on, same
+      are not created at all unless "Enable container and stack stats" is on, same
       pattern as enable_images/enable_volumes/enable_networks, so turning
       the option off removes them via the existing cleanup system rather
       than just leaving them disabled in the registry.
@@ -424,36 +451,34 @@ rules:
   repair-issues:
     status: done
     comment: >
-      Runtime control number entities raise repair issues via
-      ir.async_create_issue: runtime_update_warning when Dockhand's API
-      response includes warnings for a live property update (non-fixable,
-      informational), and runtime_memory_reverted when a memory-limit
-      decrease causes the container to stop and the safety net auto-reverts
-      it (non-fixable, actionable — tells the user the container is running
-      on its previous limit again). Both are per-container, keyed on
-      env_id + container name (+ field, for update warnings) so they don't
-      collide across containers.
+      Repair issues (all non-fixable, informational, and removed again when
+      the condition clears): fetch_failed_top_level and fetch_failed_env when
+      part of a poll keeps failing (naming the resources affected, so users
+      see why some entities are unavailable); runtime_update_warning when
+      Dockhand returns warnings for a live resource-limit change; and
+      runtime_memory_reverted when lowering a memory limit stopped the
+      container and the integration put the previous limit back.
 
   stale-devices:
     status: done
     comment: >
-      All registry cleanup is handled by a single _cleanup_stale_registry
-      function called from all three coordinator listeners and once at startup.
-      Container identifiers use container_{env_id}_{name} — name-based so
-      devices survive container recreation. Per-env online guard: only containers
-      in offline envs are preserved, online envs clean up normally. Stack,
-      image, network, volume, and update cleanup use the same per-env online
-      guard. Schedule cleanup gated on enable_schedules=True. Slow-derived sets
-      only populated when slow coordinator last succeeded. Env/group devices
-      removed when env deleted from Dockhand; offline envs preserved.
+      _cleanup_stale_registry removes devices and entities Dockhand no longer
+      reports, on every coordinator update and once at startup. Container and
+      stack devices are keyed by name, so recreation doesn't orphan them.
+      Anything it can't confirm is gone is kept: an offline environment's
+      devices, or those of a fetch that failed this cycle. For those,
+      async_remove_config_entry_device lets the user delete the device by
+      hand, and refuses for a device Dockhand still reports (it would only be
+      recreated) or a live environment and its group devices.
 
   # ── Platinum ──────────────────────────────────────────────────────────────
 
   async-dependency:
     status: done
     comment: >
-      All API calls use HA's async aiohttp session. No blocking I/O anywhere
-      in the codebase. All coordinator fetches use asyncio.gather.
+      No third-party library: the integration's own API client (api.py) is
+      fully async on Home Assistant's aiohttp session, with no blocking I/O,
+      and each coordinator fetches its environments concurrently.
 
   inject-websession:
     status: done
@@ -466,7 +491,10 @@ rules:
   strict-typing:
     status: done
     comment: >
-      py.typed marker present. from __future__ import annotations was removed
-      in 1.2.0 (Python 3.14 makes lazy annotation evaluation the default).
-      The codebase uses consistent return type annotations throughout. Full
-      mypy --strict validation is not yet configured.
+      mypy.ini carries Home Assistant core's own strict settings (those of
+      core's generated mypy.ini, which apply to integrations listed in its
+      .strict-typing file), including explicit @override and the deprecation
+      check. mypy passes on the pinned Home Assistant, and runs in CI and in
+      scripts/run_tests.sh --full. py.typed is present. There's no
+      third-party library to type: the API client is part of the integration.
+      DockhandConfigEntry is used for every entry argument.

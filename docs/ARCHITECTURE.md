@@ -114,7 +114,9 @@ release — don't reintroduce it.)
 `container_{env_id}_{name}`, `stack_{env_id}_{name}`, `env_{env_id}`. See
 `helpers.py`'s `_container_device`/`_stack_device`/`_env_device` etc. —
 always use these factories, never build `DeviceInfo` inline in a platform
-file.
+file. An entity on a container's or stack's device (fast coordinator)
+subclasses `entity.py`'s `DockhandContainerEntity`/`DockhandStackEntity`,
+which already carry the identity, the data lookup and the `device_info`.
 
 **Container identity is name-based, not ID-based**, on purpose: Docker
 container IDs change on every recreation (image update, `docker compose
@@ -163,6 +165,12 @@ restart) — rather than a bare local variable duplicated per platform file.
 Don't add a new `known_*_ids: set()` local to a platform file, and don't be
 tempted to check the real entity registry instead — both are exactly the
 mistakes §9 describes, the second one considerably worse than the first.
+
+What cleanup can't confirm is gone (an offline environment's devices, or
+those of a fetch that failed) it keeps, on purpose. For those,
+`async_remove_config_entry_device` (`__init__.py`) lets the user delete
+the device by hand from its device page, using the same `_build_live_sets`
+to refuse anything Dockhand still reports.
 
 Two-part design:
 
@@ -261,7 +269,7 @@ the shared suffix to `_TYPE_COLLISION_EXCLUDED_SUFFIXES` would be wrong
 here — that list is for entities that should be *exempt from cleanup
 entirely* (device cascade only), and both of these genuinely need their
 own independent conditional tracking, just gated on different things
-(`enable_container_stats` vs. `enable_runtime_controls` + stack-less).
+(`enable_resource_stats` vs. `enable_runtime_controls` + stack-less).
 Disambiguated by **entity domain** instead — the container-stats
 sensor is `sensor`, the runtime control is `number` — checked in the
 runtime-control `elif` branch before the suffix match, so a same-suffix
@@ -588,34 +596,139 @@ already has in hand instead of always re-fetching.
 
 ## 4. Config entry migrations
 
-`DockhandConfigFlow.VERSION` (currently 2) must be bumped whenever
-`entry.data`/`entry.options` schema changes in a way existing stored
-entries can't tolerate: a key renamed, a key removed, or a key added with
-no safe default. A key added *with* a safe default does not need a bump.
-Renaming a config option's `strings.json` display text or its Python
-constant name is free (both are cosmetic); renaming the underlying string
-*value* used as the dict key is not, and needs a migration.
+The config entry schema is at **version 2.2** (`SCHEMA_VERSION` 2,
+`SCHEMA_MINOR_VERSION` 2 in `const.py`, which `DockhandConfigFlow.VERSION`/
+`MINOR_VERSION` take). Before 1.11.0 the minor version was never set, and
+Home Assistant defaults it to 1 — so every entry from 1.8.0 to 1.10.x is 2.1.
 
-`async_migrate_entry(hass, entry)` in `__init__.py` is the mechanism —
-standard Home Assistant pattern, checks `entry.version`, transforms
-`entry.data`/`entry.options`, calls
-`hass.config_entries.async_update_entry(entry, data=..., options=...,
-version=new_version)`. The 1.8.0 cycle's `enable_updates` →
-`enable_precise_updates` rename is the first (and, as of this writing,
-only) example — copy that pattern for the next one rather than inventing
-a new approach. (A second, 2 -> 3 step briefly existed in an unreleased
-1.8.1 dev cycle, grouping `enable_precise_updates`/`poll_interval_updates`
-into a `section()` alongside the new `enable_update_entities` — reverted
-before release after the section's field labels wouldn't render
-correctly in a live instance and the exact cause couldn't be confirmed
-from source alone; see docs/BACKLOG.md. Nothing shipped at version 3, so
-there was nothing to migrate away from — `VERSION` went back to 2 and
-the 2 -> 3 step was deleted outright rather than kept as a dead migration
-path.) (The 1.2.0 session-cookie removal used a different, force-reauth-inline approach
-because that migration genuinely required
-user interaction — a straightforward value-preserving rename does not,
-and should use the formal `VERSION`/`async_migrate_entry` mechanism
-instead.)
+Where settings live: `entry.data` holds only the connection details (URL,
+token, SSL verification); everything the Configure dialog sets lives in
+`entry.options` (`OPTION_KEYS`). Read settings from `entry.options` only —
+never fall back to `entry.data`.
+
+### The standard
+
+**Downgrades are supported to the previous schema version only.** An entry
+saved at schema 2.3 can be loaded by releases on 2.2 (all of them, however
+many shared it), but not by releases on 2.1 or earlier. Each schema bump,
+minor or major, moves that window forward by one, so the old setting names
+kept for downgrades are only ever those of the latest schema change.
+
+**Minor schema versions are for ordinary releases; a major schema version
+only comes with a major integration release (X.0.0).** Home Assistant
+refuses outright to load an entry whose *major* version is newer than the
+code (`config_entries.py`'s `async_migrate`, before the integration's code
+runs), but hands a newer *minor* version to `async_migrate_entry`. So:
+
+| | Next schema minor (e.g. 2.2 → 2.3) | Next schema major (e.g. 2.x → 3.1) |
+|---|---|---|
+| Integration release | any minor/patch release | a major release only |
+| Downgrade one schema version back | works, settings kept | refused by Home Assistant — say so in the CHANGELOG |
+| Downgrade two or more back | refused (by `async_migrate_entry`) | refused |
+| Stored old-name copies | this version's renames only; the previous version's are removed | none (nothing older can load it) |
+| Upgrade from an older entry | yes, any number of releases skipped | from the previous schema major only |
+| Rename code (`RENAMED_OPTIONS`) | kept | renames two schema majors old are deleted (a test fails until they are) |
+
+What this bounds:
+- **Stored config** never carries more than one schema version's renames
+  as extra keys, whether or not a major release ever comes. That's the
+  part users carry around; it's cleaned up automatically on the next bump.
+- **Code** keeps one short `RenamedOption` line per rename until two schema
+  majors later, so an entry from any release in the previous major can
+  still upgrade, however many releases it skipped. That's the only thing
+  that accumulates between majors, and it costs a line per rename.
+
+Why "one schema version back" and not a time or release-count window: the
+code can't tell how long ago a release was, and a release-count window
+would keep names for schema versions no supported downgrade can reach. A
+schema version only changes when a stored setting does, so one back is the
+smallest window that always covers "the release I was on before this one".
+
+The refusal of an entry two or more minor versions newer exists from 1.11.0
+on. Releases before it (schema 2.1: 1.8.0–1.10.x) accept any newer minor, so
+loading a 2.3 entry there would quietly use defaults for the settings 1.11.0
+renamed; nothing can be done about code already released.
+
+### How it's built so none of this is done by hand
+
+Each rename is one `RenamedOption(old, new, major, minor)` entry in
+`RENAMED_OPTIONS` (`const.py`), recording the schema version it was made in.
+Everything else follows from the current `SCHEMA = (SCHEMA_VERSION,
+SCHEMA_MINOR_VERSION)`:
+
+- `renames_to_translate()` — renames from the current or previous schema
+  major. An entry using an old name gets it translated on upgrade.
+- `renames_to_mirror()` — renames made at exactly the current schema version
+  (except a major's first minor, which no older release can load). The old
+  name is saved alongside the new one, so a downgrade to the previous schema
+  version keeps the user's setting. The older release can't be changed to
+  translate new names back, so the newer one does it in advance. Verified
+  directly against the released 1.10.2 code: it loads a 2.2 entry, its
+  Configure dialog shows the user's values for all three settings 1.11.0
+  renamed, and it refuses a version 3 entry.
+- `async_migrate_entry` refuses (returns `False`, with a log message):
+  - an entry more than one schema major old — remove and re-add the
+    integration — rather than migrating it and silently dropping settings
+    whose renames are no longer kept;
+  - an entry two or more minor versions newer than the code — upgrade
+    again, or remove and re-add — because the release that wrote it no
+    longer keeps the old names this code reads.
+- `test_no_retired_renames_left_in_the_code` fails once a rename is two
+  schema majors old, as the reminder to delete it.
+- Entity and device registry migrations (`migration.py`) follow the same
+  rule. Each entry in `REGISTRY_MIGRATIONS` records the schema major of the
+  releases it upgrades *from* (1.4.0–1.8.0's upgrade schema 1 registries,
+  1.9.0's schema 2). Every entry newer than that already went through the
+  migration when it was upgraded, and older entries are refused, so a
+  migration runs while its schema major is the current or previous one and
+  stops after that; `test_no_retired_registry_migrations_left_in_the_code`
+  then fails until it's deleted. Schema 1 installs can still upgrade today,
+  so all of them stay until the next schema major.
+
+`_normalized_entry_config()` (`__init__.py`) applies all of it: translates
+old names, moves any setting found in `entry.data` into `entry.options`, and
+refreshes the old-name copies. It runs from `async_migrate_entry` **and on
+every setup** — after a downgrade and re-upgrade the entry's version is
+already current, so no migration step runs, and this is what picks up
+changes made while downgraded; it also restores the old-name copies after
+this release's own Configure dialog saves (a saved options flow replaces
+`entry.options` with only the fields on the form). Where an old and a
+current name are both present, the old one wins (only an older release
+could have written it, so it's the newer choice). Where a setting is in both
+`entry.data` and `entry.options`, options wins, as it always did. The pass is
+pure, idempotent, and runs before the update listener is registered, so it
+never triggers a reload.
+
+### What a change needs
+
+- A setting added *with* a safe default: nothing — no version bump.
+- A setting renamed: add a `RenamedOption` with the new schema version, bump
+  `SCHEMA_MINOR_VERSION`. If its value *format* changed rather than just its
+  name, a plain copy under the old name is wrong — give that rename a
+  conversion, or leave it unmirrored so the older release uses its default.
+  Renaming only a label in `strings.json`, or a Python constant, is free.
+- A setting removed: drop it from `OPTION_KEYS`, bump `SCHEMA_MINOR_VERSION`.
+  Nothing reads it any more; releases on the previous schema version still
+  can, so leave its stored value alone until the next schema bump.
+- A major schema bump (major integration release only): bump
+  `SCHEMA_VERSION`, set `SCHEMA_MINOR_VERSION` to 1, run the suite and
+  delete whatever `test_no_retired_renames_left_in_the_code` and
+  `test_no_retired_registry_migrations_left_in_the_code` list, and add
+  "downgrading below this release means removing and re-adding the
+  integration" to the CHANGELOG.
+- Anything that isn't a rename, move or removal: a new step in
+  `async_migrate_entry` gated on `(entry.version, entry.minor_version)`.
+
+History: 1 -> 2.1 (1.8.0) renamed `enable_updates` → `enable_precise_updates`;
+2.1 -> 2.2 (1.11.0) renamed `enable_container_stats` → `enable_resource_stats`,
+`poll_interval` → `poll_interval_fast` and `poll_interval_updates` →
+`poll_interval_precise_updates`, and moved the settings that releases before
+1.7.1 saved in `entry.data` (their setup form stored them with the
+connection details). (A version 3 briefly existed in an unreleased 1.8.1 dev
+cycle for a `section()` grouping of the update options — reverted before
+release, see docs/BACKLOG.md; nothing ever shipped at version 3.) The 1.2.0
+session-cookie removal used a different, force-reauth-inline approach in
+`async_setup_entry` because it genuinely required user interaction.
 
 **Only for transitions between released versions.** The same rule
 applies to entity/device registry migrations in `migration.py` — never
@@ -689,7 +802,13 @@ replicating its client-side logic**, whenever both are available — e.g.
 a container's `systemContainer` field (Dockhand's own classification)
 over regex-matching image names ourselves. Safer against drift (Dockhand
 can change its own classification rules without us noticing) and
-simpler to maintain.
+simpler to maintain. The stack resource stats are the same call: they
+come from Dockhand's own `GET /api/stack-stats` (1.0.52+) rather than
+being summed from container stats here, so they always match Dockhand's
+Stacks page. A Dockhand without an endpoint answers 404, raised as
+`DockhandNotFoundError` — treat that as "not supported" (create nothing,
+remove what exists), distinct from a failed fetch (keep everything, mark
+it unavailable), the way the fast coordinator's `stack_stats` does.
 
 **Check the frontend, not just the API route, for anything user-facing.**
 A field can be genuinely absent from a server response in a case

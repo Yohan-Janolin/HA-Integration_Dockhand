@@ -12,7 +12,9 @@ A unified `scripts/run_tests.sh` handles both lint-only and the full PHCC suite,
 # Lint + AST only (any Python 3.x — no homeassistant required)
 bash scripts/run_tests.sh
 
-# Full suite: ruff + AST + all pytest tests via PHCC (requires Python 3.14.2+)
+# Full: ruff + AST + mypy (strict) + quality scale rule check + all pytest
+# tests via PHCC with a 100% line coverage gate (requires Python 3.14.2+; the rule
+# check fetches Home Assistant's rule list from GitHub)
 bash scripts/run_tests.sh --full
 
 # Full suite in a specific venv path
@@ -48,11 +50,11 @@ pytest tests/test_api.py -v
 
 ### PHCC version ↔ HA version
 
-PHCC patch versions increment daily with each HA release. The pin in `requirements_test.txt` should match the minimum supported HA version for this integration (currently 2026.3+).
+PHCC patch versions increment with each HA release. The pin in `requirements_test.txt` tracks the latest stable HA release (Dependabot proposes bumps), so the suite runs against what most users have installed; the minimum supported HA version (currently 2026.3) is declared separately in `hacs.json`.
 
 | PHCC version | HA version  |
 |--------------|-------------|
-| 0.13.346     | 2026.7.2    |
+| 0.13.372     | 2026.10.1   |
 | 0.13.317+    | Requires Python 3.14.2+ |
 
 To update the pin after a new HA release: find the PHCC version corresponding to the new HA release on the [PHCC releases page](https://github.com/MatthewFlamm/pytest-homeassistant-custom-component/releases) and update `requirements_test.txt`.

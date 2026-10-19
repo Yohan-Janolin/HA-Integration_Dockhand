@@ -1,11 +1,11 @@
 import asyncio
-from typing import Any
+from typing import Any, override
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -20,22 +20,20 @@ from .coordinator import (
     DockhandSlowCoordinator,
     DockhandUpdateCoordinator,
 )
+from .entity import DockhandContainerEntity, DockhandStackEntity
 from .helpers import (
     _actionable_pending_update_container_ids,
     _all_envs,
-    _compose_project,
-    _container_device,
     _coordinator_env,
     _env_device,
-    _find_container,
-    _find_stack,
+    _find_git_stack,
     _stack_device,
     _stack_has_system_container,
     already_registered,
 )
 
-# Coordinator-based platform. 0 = no HA-level parallel update limit;
-# the coordinator serialises data access.
+# Reads come from the coordinators. Actions aren't limited: each is one
+# request to Dockhand, which queues the Docker work itself.
 PARALLEL_UPDATES = 0
 
 # Same values as update.py's _poll_job — one shared job-polling budget
@@ -133,7 +131,10 @@ async def async_setup_entry(
             )
             has_updatable = update_entities_enabled and bool(
                 _actionable_pending_update_container_ids(
-                    env_containers, pending, update_env_data
+                    env_containers,
+                    pending,
+                    update_env_data,
+                    env_data.get("pending_update_details"),
                 )
             )
             if has_updatable:
@@ -178,10 +179,10 @@ async def async_setup_entry(
 
             for stack in env_data.get("stacks") or []:
                 has_system = _stack_has_system_container(
-                    stack, env_data.get("containers")
+                    stack, env_data.get("containers") or []
                 )
                 if not has_system:
-                    restart_button = DockhandStackRestartButton(
+                    stack_restart_button = DockhandStackRestartButton(
                         fast,
                         client,
                         entry.entry_id,
@@ -194,10 +195,10 @@ async def async_setup_entry(
                         hass,
                         known_ids,
                         "button",
-                        restart_button.unique_id,
+                        stack_restart_button.unique_id,
                         pending_readd_ids=pending_readd_ids,
                     ):
-                        new.append(restart_button)
+                        new.append(stack_restart_button)
                     if stack.get("sourceType") == "internal":
                         deploy_button = DockhandStackDeployButton(
                             fast,
@@ -257,13 +258,9 @@ async def async_setup_entry(
     )
 
 
-class _BaseFastContainerButton(
-    CoordinatorEntity[DockhandFastCoordinator], ButtonEntity
-):
+class _BaseFastContainerButton(DockhandContainerEntity, ButtonEntity):
     """Common base for per-container buttons."""
 
-    _attr_has_entity_name = True
-
     def __init__(
         self,
         coordinator: DockhandFastCoordinator,
@@ -272,40 +269,15 @@ class _BaseFastContainerButton(
         env_id: int,
         env_name: str,
         base_url: str,
-        container: dict,
+        container: dict[str, Any],
     ) -> None:
-        super().__init__(coordinator)
+        super().__init__(coordinator, entry_id, env_id, env_name, base_url, container)
         self._client = client
-        self._entry_id = entry_id
-        self._env_id = env_id
-        self._env_name = env_name
-        self._base_url = base_url
-        self._container_name = container.get("name", "")
-
-    def _container(self) -> dict | None:
-        return _find_container(
-            self.coordinator.data, self._env_id, self._container_name
-        )
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        c = self._container()
-        return _container_device(
-            getattr(self, "hass", None),
-            self._entry_id,
-            self._container_name,
-            self._env_id,
-            self._env_name,
-            self._base_url,
-            _compose_project(c),
-        )
 
 
-class _BaseFastStackButton(CoordinatorEntity[DockhandFastCoordinator], ButtonEntity):
+class _BaseFastStackButton(DockhandStackEntity, ButtonEntity):
     """Common base for per-stack buttons."""
 
-    _attr_has_entity_name = True
-
     def __init__(
         self,
         coordinator: DockhandFastCoordinator,
@@ -314,31 +286,10 @@ class _BaseFastStackButton(CoordinatorEntity[DockhandFastCoordinator], ButtonEnt
         env_id: int,
         env_name: str,
         base_url: str,
-        stack: dict,
+        stack: dict[str, Any],
     ) -> None:
-        super().__init__(coordinator)
+        super().__init__(coordinator, entry_id, env_id, env_name, base_url, stack)
         self._client = client
-        self._entry_id = entry_id
-        self._env_id = env_id
-        self._env_name = env_name
-        self._base_url = base_url
-        self._stack_name = stack.get("name", "")
-
-    def _stack(self) -> dict | None:
-        return _find_stack(self.coordinator.data, self._env_id, self._stack_name)
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        s = self._stack()
-        return _stack_device(
-            getattr(self, "hass", None),
-            self._entry_id,
-            self._stack_name,
-            self._env_id,
-            self._env_name,
-            self._base_url,
-            source_type=(s or {}).get("sourceType"),
-        )
 
 
 class DockhandContainerRestartButton(_BaseFastContainerButton):
@@ -364,6 +315,7 @@ class DockhandContainerRestartButton(_BaseFastContainerButton):
             f"{self._entry_id}_{self._env_id}_container_{self._container_name}_restart"
         )
 
+    @override
     async def async_press(self) -> None:
         c = self._container()
         if not c:
@@ -405,6 +357,7 @@ class DockhandStackRestartButton(_BaseFastStackButton):
             f"{self._entry_id}_{self._env_id}_stack_{self._stack_name}_restart"
         )
 
+    @override
     async def async_press(self) -> None:
         try:
             await self._client.async_restart_stack(self._env_id, self._stack_name)
@@ -438,12 +391,13 @@ class DockhandStackDeployButton(_BaseFastStackButton):
 
     _attr_translation_key = "stack_deploy"
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._attr_unique_id = (
             f"{self._entry_id}_{self._env_id}_stack_{self._stack_name}_deploy"
         )
 
+    @override
     async def async_press(self) -> None:
         if not self._stack():
             raise HomeAssistantError(
@@ -557,14 +511,19 @@ class DockhandEnvBulkUpdateButton(
             else None
         )
         return _actionable_pending_update_container_ids(
-            containers, pending, update_env_data
+            containers,
+            pending,
+            update_env_data,
+            env_data.get("pending_update_details"),
         )
 
     @property
+    @override
     def available(self) -> bool:
         return super().available and bool(self._updatable_container_ids())
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _env_device(self._entry_id, self._env_id, self._env_name, self._base_url)
 
@@ -573,10 +532,12 @@ class DockhandEnvBulkUpdateButton(
         pattern as the per-container update entities in update.py."""
         try:
             settings = await self._client.async_get_update_check_settings(self._env_id)
-            return settings.get("vulnerabilityCriteria")
         except Exception:
             return None
+        criteria = settings.get("vulnerabilityCriteria")
+        return str(criteria) if criteria else None
 
+    @override
     async def async_press(self) -> None:
         container_ids = self._updatable_container_ids()
         if not container_ids:
@@ -752,9 +713,11 @@ class DockhandCheckUpdatesButton(
         self._attr_unique_id = f"{entry_id}_{env_id}_check_updates"
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _env_device(self._entry_id, self._env_id, self._env_name, self._base_url)
 
+    @override
     async def async_press(self) -> None:
         try:
             items = await self._client.async_check_container_updates(self._env_id)
@@ -806,15 +769,11 @@ class _BaseSlowGitStackButton(CoordinatorEntity[DockhandSlowCoordinator], Button
         self._base_url = base_url
         self._stack_name = git_stack.get("stackName", "")
 
-    def _git_stack(self) -> dict | None:
-        slow_data = self.coordinator.data or {}
-        env = _coordinator_env(slow_data, self._env_id)
-        for gs in env.get("git_stacks") or []:
-            if gs.get("stackName") == self._stack_name:
-                return gs
-        return None
+    def _git_stack(self) -> dict[str, Any] | None:
+        return _find_git_stack(self.coordinator.data, self._env_id, self._stack_name)
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _stack_device(
             getattr(self, "hass", None),
@@ -847,7 +806,7 @@ class DockhandGitStackDeployButton(_BaseSlowGitStackButton):
     _attr_translation_key = "git_stack_deploy"
 
     def __init__(
-        self, fast_coordinator: DockhandFastCoordinator, *args, **kwargs
+        self, fast_coordinator: DockhandFastCoordinator, *args: Any, **kwargs: Any
     ) -> None:
         super().__init__(*args, **kwargs)
         self._fast_coordinator = fast_coordinator
@@ -865,15 +824,18 @@ class DockhandGitStackDeployButton(_BaseSlowGitStackButton):
         return False
 
     @property
+    @override
     def name(self) -> str:
         return "Deploy" if self._is_down() else "Sync from Git"
 
     @property
+    @override
     def icon(self) -> str:
         # Rocket for Deploy, refresh (Dockhand's own RefreshCw, styled
         # like its restart icon) for Sync from Git — same source as name.
         return "mdi:rocket-launch-outline" if self._is_down() else "mdi:refresh"
 
+    @override
     async def async_press(self) -> None:
         gs = self._git_stack()
         if not gs:

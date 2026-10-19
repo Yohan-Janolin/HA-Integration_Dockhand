@@ -36,7 +36,7 @@ BASE_CONNECTION = {
 
 # Minimal options submitted on the setup_options step (all defaults accepted).
 BASE_OPTIONS = {
-    "poll_interval": 60,
+    "poll_interval_fast": 60,
     "poll_interval_slow": 600,
     "enable_schedules": False,
     "enable_images": False,
@@ -44,7 +44,7 @@ BASE_OPTIONS = {
     "enable_networks": False,
     "enable_update_entities": True,
     "enable_precise_updates": False,
-    "poll_interval_updates": 86400,
+    "poll_interval_precise_updates": 86400,
 }
 
 # Legacy entry data shape (poll/enable keys stored in data by older versions).
@@ -52,7 +52,7 @@ BASE_OPTIONS = {
 LEGACY_ENTRY_DATA = {
     "api_url": "http://dh.test:3000",
     "verify_ssl": True,
-    "poll_interval": 60,
+    "poll_interval_fast": 60,
     "poll_interval_slow": 600,
     "enable_schedules": False,
     "enable_images": False,
@@ -130,7 +130,7 @@ async def test_step_user_no_auth_creates_entry(hass: HomeAssistant):
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert "api_token" not in result["data"]
-    assert result["options"]["poll_interval"] == 60
+    assert result["options"]["poll_interval_fast"] == 60
 
 
 async def test_step_user_strips_whitespace_from_api_url(hass: HomeAssistant):
@@ -233,7 +233,7 @@ async def test_step_token_success_creates_entry(hass: HomeAssistant):
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert result["data"]["api_token"] == MOCK_TOKEN
     assert result["data"]["api_url"] == "http://dh.test:3000"
-    assert result["options"]["poll_interval"] == 60
+    assert result["options"]["poll_interval_fast"] == 60
 
 
 async def test_step_token_invalid_token_shows_invalid_auth(hass: HomeAssistant):
@@ -531,10 +531,10 @@ async def test_options_flow_saves_options(hass: HomeAssistant):
     assert result["type"] == FlowResultType.FORM
 
     result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"poll_interval": 120}
+        result["flow_id"], {"poll_interval_fast": 120}
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
-    assert entry.options["poll_interval"] == 120
+    assert entry.options["poll_interval_fast"] == 120
 
 
 async def test_options_flow_runtime_controls_defaults_off(hass: HomeAssistant):
@@ -553,7 +553,7 @@ async def test_options_flow_runtime_controls_defaults_off(hass: HomeAssistant):
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
     result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"poll_interval": 60}
+        result["flow_id"], {"poll_interval_fast": 60}
     )
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options["enable_runtime_controls"] is False
@@ -601,7 +601,7 @@ async def test_options_flow_rejects_interval_below_minimum(hass: HomeAssistant):
 
     with pytest.raises(InvalidData):
         await hass.config_entries.options.async_configure(
-            result["flow_id"], {"poll_interval": 0}
+            result["flow_id"], {"poll_interval_fast": 0}
         )
 
 
@@ -646,7 +646,7 @@ async def test_options_change_triggers_reload(hass: HomeAssistant):
         ) as mock_reload:
             result = await hass.config_entries.options.async_init(entry.entry_id)
             await hass.config_entries.options.async_configure(
-                result["flow_id"], {"poll_interval": 120}
+                result["flow_id"], {"poll_interval_fast": 120}
             )
             await hass.async_block_till_done()
             mock_reload.assert_called_once_with(entry.entry_id)
@@ -672,7 +672,7 @@ async def test_options_change_triggers_reload(hass: HomeAssistant):
 # own full copy of the translations, and both are checked below. They drifted
 # apart for real once already: config.step.setup_options was still showing
 # the pre-1.8.0 "enable_updates" key and was missing enable_runtime_controls/
-# enable_container_stats entirely, undetected until this test existed.
+# enable_resource_stats entirely, undetected until this test existed.
 # ---------------------------------------------------------------------------
 
 _OPTIONS_SCHEMA_STEP_PATHS = [
@@ -872,3 +872,61 @@ def test_every_locale_covers_every_strings_json_key_with_non_empty_value():
         f"Locale file(s) missing or with empty values for strings.json "
         f"key(s): {problems}"
     )
+
+
+async def test_step_reauth_confirm_connection_error(hass: HomeAssistant):
+    result = await hass.config_entries.flow.async_init(
+        "dockhand", context={"source": "user"}
+    )
+    with _patch_client():
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], BASE_CONNECTION
+        )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], BASE_OPTIONS
+    )
+    entry = result["result"]
+
+    result = await hass.config_entries.flow.async_init(
+        "dockhand",
+        context={"source": "reauth", "entry_id": entry.entry_id},
+    )
+    with _patch_client(probe_side_effect=Exception("timeout")):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"api_token": "dh_new"}
+        )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"]["base"] == "cannot_connect"
+
+
+async def test_step_reconfigure_token_step_updates_the_entry(hass: HomeAssistant):
+    """Reconfigure routed to the token step (server now requires a token):
+    a token that works updates the existing entry and finishes the flow."""
+    result = await hass.config_entries.flow.async_init(
+        "dockhand", context={"source": "user"}
+    )
+    with _patch_client():
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], BASE_CONNECTION
+        )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], BASE_OPTIONS
+    )
+    entry = result["result"]
+
+    result = await hass.config_entries.flow.async_init(
+        "dockhand",
+        context={"source": "reconfigure", "entry_id": entry.entry_id},
+    )
+    with _patch_client(probe_side_effect=DockhandAuthError("401")):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**BASE_CONNECTION, "api_token": ""}
+        )
+    assert result["step_id"] == "token"
+    with _patch_client():
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"api_token": "dh_now_required"}
+        )
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data["api_token"] == "dh_now_required"

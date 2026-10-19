@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import timedelta
-from typing import Any
+from typing import Any, override
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -9,21 +9,21 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import DockhandAuthError, DockhandClient
+from .api import DockhandAuthError, DockhandClient, DockhandNotFoundError
 from .const import (
-    CONF_ENABLE_CONTAINER_STATS,
     CONF_ENABLE_IMAGES,
     CONF_ENABLE_NETWORKS,
+    CONF_ENABLE_RESOURCE_STATS,
     CONF_ENABLE_RUNTIME_CONTROLS,
     CONF_ENABLE_SCHEDULES,
     CONF_ENABLE_VOLUMES,
-    CONF_POLL_INTERVAL,
+    CONF_POLL_INTERVAL_FAST,
+    CONF_POLL_INTERVAL_PRECISE_UPDATES,
     CONF_POLL_INTERVAL_SLOW,
-    CONF_POLL_INTERVAL_UPDATES,
-    DEFAULT_ENABLE_CONTAINER_STATS,
-    DEFAULT_POLL_INTERVAL,
+    DEFAULT_ENABLE_RESOURCE_STATS,
+    DEFAULT_POLL_INTERVAL_FAST,
+    DEFAULT_POLL_INTERVAL_PRECISE_UPDATES,
     DEFAULT_POLL_INTERVAL_SLOW,
-    DEFAULT_POLL_INTERVAL_UPDATES,
     DOMAIN,
 )
 from .helpers import (
@@ -82,6 +82,38 @@ def _unwrap(
     return val
 
 
+def _pending_detail(has_update: bool, row: dict[str, Any]) -> dict[str, Any]:
+    """One container's pending_update_details entry, from a pending-updates
+    row or a check-updates result.
+
+    Besides an installable update, Dockhand reports two that aren't:
+    pinnedToDigest (1.0.54+) — the image is pinned to a digest whose tag has
+    moved on, so the pin has to change — and releaseAgeRemainingHours
+    (1.0.52+) — an update held back until the new image passes the minimum
+    image age. Neither sets hasImageUpdate / hasUpdate.
+    """
+    hours = row.get("releaseAgeRemainingHours")
+    return {
+        "hasImageUpdate": has_update,
+        "newerVersion": row.get("newerVersion") or None,
+        "pinnedToDigest": bool(row.get("pinnedToDigest")),
+        "releaseAgeRemainingHours": hours
+        if isinstance(hours, int) and not isinstance(hours, bool) and hours > 0
+        else None,
+        # When Dockhand worked out the hours above; it doesn't update them
+        # until its next check, so the countdown runs from here.
+        "checkedAt": row.get("checkedAt"),
+        # check-updates' own system-container classification, which can
+        # catch one the containers list misses (see
+        # helpers._is_system_container). pending-updates rows have none.
+        **(
+            {"systemContainer": row["systemContainer"]}
+            if row.get("systemContainer")
+            else {}
+        ),
+    }
+
+
 class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Polls 60s: dashboard stats, containers, stacks, container resource
     stats, pending update flags.
@@ -103,6 +135,7 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "containers": [],
                 "stacks": [],
                 "container_stats": {name: {}},
+                "stack_stats": {stack_name: {}} | None,
                 "pending_update_container_ids": {container_id, ...},
                 "pending_update_details": {
                     container_id: {
@@ -110,6 +143,9 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "newerVersion": {"tag": str, "bump": str,
                                          "skipped": [str, ...],
                                          "digest": str | None} | None,
+                        "pinnedToDigest": bool,
+                        "releaseAgeRemainingHours": int | None,
+                        "checkedAt": str | None,
                     }
                 },
             }
@@ -151,8 +187,8 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         entry: ConfigEntry | None = None,
     ) -> None:
         self.client = client
-        self._enable_container_stats = bool(
-            config.get(CONF_ENABLE_CONTAINER_STATS, DEFAULT_ENABLE_CONTAINER_STATS)
+        self._enable_resource_stats = bool(
+            config.get(CONF_ENABLE_RESOURCE_STATS, DEFAULT_ENABLE_RESOURCE_STATS)
         )
         # Dockhand never persists a pending-updates row for a system
         # container (dockhand itself, Hawser) — both its scheduled check and
@@ -168,11 +204,14 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER,
             name=f"{DOMAIN}_fast",
             update_interval=timedelta(
-                seconds=int(config.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
+                seconds=int(
+                    config.get(CONF_POLL_INTERVAL_FAST, DEFAULT_POLL_INTERVAL_FAST)
+                )
             ),
             config_entry=entry,
         )
 
+    @override
     async def _async_update_data(self) -> dict[str, Any]:
         # Retry on 401 before surfacing ConfigEntryAuthFailed. A single transient
         # 401 — e.g. during a brief Dockhand restart or Hawser connectivity hiccup —
@@ -279,7 +318,7 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Named tasks rather than a positionally-indexed list — two
             # independent conditions (update_check_enabled,
-            # enable_container_stats) now decide which calls happen, and
+            # enable_resource_stats) now decide which calls happen, and
             # position-tracking a list with two independent optional
             # entries is exactly the kind of thing that's easy to get
             # subtly wrong later when a third condition gets added.
@@ -287,8 +326,9 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "containers": self.client.async_get_containers(env_id),
                 "stacks": self.client.async_get_stacks(env_id),
             }
-            if self._enable_container_stats:
+            if self._enable_resource_stats:
                 tasks["container_stats"] = self.client.async_get_container_stats(env_id)
+                tasks["stack_stats"] = self.client.async_get_stack_stats(env_id)
             if update_check_enabled:
                 tasks["pending_updates"] = self.client.async_get_pending_updates(env_id)
 
@@ -321,9 +361,9 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Index container stats by name for O(1) lookup from sensor entities.
             # Stopped/exited containers are absent from the stats response — their
             # sensors will return None (unavailable) until the container is running.
-            # Empty (not fetched at all) whenever "Enable container stats" is off —
-            # nothing consumes it in that case, so there's no reason to pay for
-            # the API call every 60s just to throw the result away.
+            # Empty (not fetched at all) whenever "Enable container and stack
+            # stats" is off — nothing consumes it in that case, so there's no
+            # reason to pay for the API call every 60s just to throw it away.
             container_stats: dict[str, dict] = {}
             if "container_stats" in results:
                 raw_stats = _safe_list(
@@ -340,6 +380,31 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     for s in raw_stats
                     if isinstance(s, dict) and "name" in s
                 }
+
+            # Dockhand's own per-stack totals (1.0.52+). None means "no stack
+            # stats here": not fetched (container stats off), or a Dockhand
+            # too old to have the endpoint (404 — checked every poll, so an
+            # upgrade is picked up without a reload, at the cost of one
+            # cheap 404). A real failure is recorded in `failures` instead,
+            # so cleanup can tell it apart from the endpoint not existing.
+            stack_stats: dict[str, dict] | None = None
+            if "stack_stats" in results:
+                raw = results["stack_stats"]
+                if isinstance(raw, DockhandNotFoundError):
+                    _LOGGER.debug(
+                        "Dockhand: no stack stats for env=%s (needs Dockhand 1.0.52+)",
+                        env_id,
+                    )
+                else:
+                    raw_list = _unwrap(
+                        raw, None, f"stack_stats env={env_id}", failures, "stack_stats"
+                    )
+                    if raw_list is not None:
+                        stack_stats = {
+                            s["name"]: s
+                            for s in _safe_list(raw_list)
+                            if isinstance(s, dict) and "name" in s
+                        }
 
             # pending_update_details keeps EVERY row from pending-updates —
             # both actionable (hasImageUpdate=True) and semver-advisory-only
@@ -367,10 +432,9 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         continue
                     container_id = p["containerId"]
                     has_image_update = bool(p.get("hasImageUpdate"))
-                    pending_update_details[container_id] = {
-                        "hasImageUpdate": has_image_update,
-                        "newerVersion": p.get("newerVersion") or None,
-                    }
+                    pending_update_details[container_id] = _pending_detail(
+                        has_image_update, p
+                    )
                     if has_image_update:
                         pending_update_container_ids.add(container_id)
 
@@ -403,6 +467,7 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 ),
                 "container_stats": container_stats,
+                "stack_stats": stack_stats,
                 "pending_update_container_ids": pending_update_container_ids,
                 "pending_update_details": pending_update_details,
                 # Which of the above failed to fetch this cycle, rather
@@ -417,7 +482,9 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for result in await asyncio.gather(
             *[_fetch_env(env_id) for env_id in all_stats], return_exceptions=True
         ):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
+                if not isinstance(result, Exception):
+                    raise result
                 _LOGGER.warning("Dockhand fast env error: %s", result)
             else:
                 env_id, data = result
@@ -507,10 +574,7 @@ class DockhandFastCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not container_id:
                 continue
             has_update = bool(item.get("hasUpdate"))
-            pending_update_details[container_id] = {
-                "hasImageUpdate": has_update,
-                "newerVersion": item.get("newerVersion") or None,
-            }
+            pending_update_details[container_id] = _pending_detail(has_update, item)
             if has_update:
                 pending_update_container_ids.add(container_id)
             if item.get("systemContainer") and has_update:
@@ -601,6 +665,7 @@ class DockhandSlowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             config_entry=entry,
         )
 
+    @override
     async def _async_update_data(self) -> dict[str, Any]:
         try:
             result = await self._fetch()
@@ -862,7 +927,9 @@ class DockhandSlowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for result in await asyncio.gather(
             *[_fetch_env(env_id) for env_id in env_ids], return_exceptions=True
         ):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
+                if not isinstance(result, Exception):
+                    raise result
                 _LOGGER.warning("Dockhand slow env error: %s", result)
             else:
                 env_id, data = result
@@ -1030,22 +1097,20 @@ class DockhandUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=timedelta(
                 seconds=int(
                     config.get(
-                        CONF_POLL_INTERVAL_UPDATES, DEFAULT_POLL_INTERVAL_UPDATES
+                        CONF_POLL_INTERVAL_PRECISE_UPDATES,
+                        DEFAULT_POLL_INTERVAL_PRECISE_UPDATES,
                     )
                 )
             ),
             config_entry=entry,
         )
 
+    @override
     async def _async_update_data(self) -> dict[str, Any]:
-        try:
-            return await self._fetch()
-        except DockhandAuthError as err:
-            raise UpdateFailed(
-                "API token rejected — fast coordinator will surface reauth"
-            ) from err
-        except Exception as err:
-            raise UpdateFailed(f"Update check error: {err}") from err
+        # Never fails as a whole: each environment's failure (a rejected token
+        # included, which the fast coordinator surfaces as re-auth) only keeps
+        # that environment's last result — see _fetch().
+        return await self._fetch()
 
     async def _fetch_one_env(self, env_id: int) -> dict[str, dict]:
         """Fetch and index one environment's pending updates. Raises on
@@ -1091,8 +1156,10 @@ class DockhandUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             *[_fetch_env_resilient(env_id) for env_id in env_ids],
             return_exceptions=True,
         ):
-            if isinstance(result, Exception):
-                _LOGGER.warning("Dockhand update env error: %s", result)
+            if isinstance(result, BaseException):
+                # Only a cancellation gets here: _fetch_env_resilient
+                # handles every Exception itself.
+                raise result
             else:
                 env_id, data = result
                 out[env_id] = data

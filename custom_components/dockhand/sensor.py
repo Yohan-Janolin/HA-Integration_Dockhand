@@ -1,48 +1,51 @@
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, override
 
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
+    SensorEntityDescription,
     SensorStateClass,
 )
 from homeassistant.const import EntityCategory, UnitOfInformation
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import DockhandConfigEntry
 from .const import (
     CONF_API_URL,
-    CONF_ENABLE_CONTAINER_STATS,
     CONF_ENABLE_IMAGES,
     CONF_ENABLE_NETWORKS,
+    CONF_ENABLE_RESOURCE_STATS,
     CONF_ENABLE_SCHEDULES,
     CONF_ENABLE_VOLUMES,
-    DEFAULT_ENABLE_CONTAINER_STATS,
+    DEFAULT_ENABLE_RESOURCE_STATS,
 )
 from .coordinator import (
     DockhandFastCoordinator,
     DockhandSlowCoordinator,
     DockhandUpdateCoordinator,
 )
+from .entity import DockhandContainerEntity, DockhandStackEntity
 from .helpers import (
     _actionable_pending_update_container_ids,
     _all_envs,
-    _compose_project,
-    _container_device,
     _container_has_healthcheck,
+    _container_has_held_update_only,
     _container_has_pending_update,
+    _container_has_pinned_digest_only,
     _container_has_version_suggestion_only,
     _coordinator_env,
     _ensure_env_devices,
     _ensure_hub_devices,
     _env_device,
-    _find_container,
-    _find_stack,
+    _find_git_stack,
     _image_display_name,
     _image_group_device,
     _network_group_device,
@@ -96,21 +99,21 @@ async def async_setup_entry(
     base_url: str = entry.data.get(CONF_API_URL, "")
 
     def _opt(key: str, default: Any) -> Any:
-        return entry.options.get(key, entry.data.get(key, default))
+        return entry.options.get(key, default)
 
     enable_schedules = _opt(CONF_ENABLE_SCHEDULES, False)
     enable_images = _opt(CONF_ENABLE_IMAGES, False)
     enable_networks = _opt(CONF_ENABLE_NETWORKS, False)
     enable_volumes = _opt(CONF_ENABLE_VOLUMES, False)
-    enable_container_stats = _opt(
-        CONF_ENABLE_CONTAINER_STATS, DEFAULT_ENABLE_CONTAINER_STATS
+    enable_resource_stats = _opt(
+        CONF_ENABLE_RESOURCE_STATS, DEFAULT_ENABLE_RESOURCE_STATS
     )
 
     known_ids = entry.runtime_data.known_entity_ids
 
     pending_readd_ids = entry.runtime_data.pending_readd_entity_ids
 
-    def _already_registered(domain: str, unique_id: str) -> bool:
+    def _already_registered(domain: str, unique_id: str | None) -> bool:
         # See helpers.py's already_registered() for the full reasoning —
         # moved there once switch.py/number.py/select.py/button.py/
         # binary_sensor.py needed the exact same check too.
@@ -201,13 +204,13 @@ async def async_setup_entry(
                 # does for those other toggles. Checked via its own
                 # representative entity, independent of state_sensor above
                 # — nesting this inside that check (as an earlier version
-                # of this code did) meant turning "Enable container stats"
+                # of this code did) meant turning "Enable container and stack stats"
                 # on for a container that already existed before that
                 # point would never create its stats sensors until an HA
                 # restart, the exact same class of staleness the
                 # known_health_keys comment above already called out for
                 # health sensors specifically, just not caught here too.
-                if enable_container_stats:
+                if enable_resource_stats:
                     cpu_sensor = DockhandContainerCpuSensor(
                         fast,
                         entry.entry_id,
@@ -215,7 +218,7 @@ async def async_setup_entry(
                         env_name,
                         base_url,
                         container,
-                        enable_container_stats,
+                        enable_resource_stats,
                     )
                     if not _already_registered("sensor", cpu_sensor.unique_id):
                         new += [
@@ -227,7 +230,7 @@ async def async_setup_entry(
                                 env_name,
                                 base_url,
                                 container,
-                                enable_container_stats,
+                                enable_resource_stats,
                             ),
                             DockhandContainerMemoryPercentSensor(
                                 fast,
@@ -236,7 +239,7 @@ async def async_setup_entry(
                                 env_name,
                                 base_url,
                                 container,
-                                enable_container_stats,
+                                enable_resource_stats,
                             ),
                             DockhandContainerMemoryLimitSensor(
                                 fast,
@@ -245,7 +248,7 @@ async def async_setup_entry(
                                 env_name,
                                 base_url,
                                 container,
-                                enable_container_stats,
+                                enable_resource_stats,
                             ),
                             DockhandContainerNetworkRxSensor(
                                 fast,
@@ -254,7 +257,7 @@ async def async_setup_entry(
                                 env_name,
                                 base_url,
                                 container,
-                                enable_container_stats,
+                                enable_resource_stats,
                             ),
                             DockhandContainerNetworkTxSensor(
                                 fast,
@@ -263,7 +266,7 @@ async def async_setup_entry(
                                 env_name,
                                 base_url,
                                 container,
-                                enable_container_stats,
+                                enable_resource_stats,
                             ),
                             DockhandContainerBlockReadSensor(
                                 fast,
@@ -272,7 +275,7 @@ async def async_setup_entry(
                                 env_name,
                                 base_url,
                                 container,
-                                enable_container_stats,
+                                enable_resource_stats,
                             ),
                             DockhandContainerBlockWriteSensor(
                                 fast,
@@ -281,7 +284,7 @@ async def async_setup_entry(
                                 env_name,
                                 base_url,
                                 container,
-                                enable_container_stats,
+                                enable_resource_stats,
                             ),
                         ]
 
@@ -297,6 +300,25 @@ async def async_setup_entry(
                             fast, entry.entry_id, env_id, env_name, base_url, stack
                         ),
                     ]
+                # Same gating and representative-entity check as the
+                # container stats sensors above, plus Dockhand having the
+                # stack stats endpoint at all (stack_stats is None
+                # otherwise — see the fast coordinator).
+                if enable_resource_stats and env_data.get("stack_stats") is not None:
+                    stats_sensors = [
+                        DockhandStackStatsSensor(
+                            fast,
+                            entry.entry_id,
+                            env_id,
+                            env_name,
+                            base_url,
+                            stack,
+                            description,
+                        )
+                        for description in STACK_STATS_SENSORS
+                    ]
+                    if not _already_registered("sensor", stats_sensors[0].unique_id):
+                        new += stats_sensors
 
         return new
 
@@ -521,6 +543,7 @@ class BaseFastEnvSensor(CoordinatorEntity[DockhandFastCoordinator], SensorEntity
         return _coordinator_env(self.coordinator.data, self._env_id).get("stats") or {}
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _env_device(
             self._entry_id,
@@ -531,31 +554,8 @@ class BaseFastEnvSensor(CoordinatorEntity[DockhandFastCoordinator], SensorEntity
         )
 
 
-class BaseFastContainerSensor(CoordinatorEntity[DockhandFastCoordinator], SensorEntity):
+class BaseFastContainerSensor(DockhandContainerEntity, SensorEntity):
     """Base for per-container fast-coordinator sensors."""
-
-    _attr_has_entity_name = True
-
-    def __init__(
-        self,
-        coordinator: DockhandFastCoordinator,
-        entry_id: str,
-        env_id: int,
-        env_name: str,
-        base_url: str,
-        container: dict,
-    ) -> None:
-        super().__init__(coordinator)
-        self._entry_id = entry_id
-        self._env_id = env_id
-        self._env_name = env_name
-        self._base_url = base_url
-        self._container_name = container.get("name", "")
-
-    def _container(self) -> dict | None:
-        return _find_container(
-            self.coordinator.data, self._env_id, self._container_name
-        )
 
     def _container_stats(self) -> dict | None:
         """Return the latest stats snapshot for this container, or None.
@@ -569,19 +569,6 @@ class BaseFastContainerSensor(CoordinatorEntity[DockhandFastCoordinator], Sensor
             _coordinator_env(self.coordinator.data, self._env_id).get("container_stats")
             or {}
         ).get(self._container_name)
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        c = self._container()
-        return _container_device(
-            getattr(self, "hass", None),
-            self._entry_id,
-            self._container_name,
-            self._env_id,
-            self._env_name,
-            self._base_url,
-            _compose_project(c),
-        )
 
 
 class BaseFastContainerStatsSensor(BaseFastContainerSensor):
@@ -610,6 +597,7 @@ class BaseFastContainerStatsSensor(BaseFastContainerSensor):
         self._attr_entity_registry_enabled_default = stats_enabled
 
     @property
+    @override
     def available(self) -> bool:
         return super().available and self._container_stats() is not None
 
@@ -637,42 +625,8 @@ def _resolve_container_names(
     return sorted(names, key=str.lower)
 
 
-class BaseFastStackSensor(CoordinatorEntity[DockhandFastCoordinator], SensorEntity):
+class BaseFastStackSensor(DockhandStackEntity, SensorEntity):
     """Base for per-stack fast-coordinator sensors."""
-
-    _attr_has_entity_name = True
-
-    def __init__(
-        self,
-        coordinator: DockhandFastCoordinator,
-        entry_id: str,
-        env_id: int,
-        env_name: str,
-        base_url: str,
-        stack: dict,
-    ) -> None:
-        super().__init__(coordinator)
-        self._entry_id = entry_id
-        self._env_id = env_id
-        self._env_name = env_name
-        self._base_url = base_url
-        self._stack_name = stack.get("name", "")
-
-    def _stack(self) -> dict | None:
-        return _find_stack(self.coordinator.data, self._env_id, self._stack_name)
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        s = self._stack()
-        return _stack_device(
-            getattr(self, "hass", None),
-            self._entry_id,
-            self._stack_name,
-            self._env_id,
-            self._env_name,
-            self._base_url,
-            source_type=(s or {}).get("sourceType"),
-        )
 
 
 class DockhandEnvConnectionTypeSensor(BaseFastEnvSensor):
@@ -703,6 +657,7 @@ class DockhandEnvConnectionTypeSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_connection_type"
 
     @property
+    @override
     def native_value(self) -> str | None:
         v = self._stats().get("connectionType")
         return v if v in self._attr_options else None
@@ -729,11 +684,13 @@ class DockhandEnvCpuSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_cpu"
 
     @property
+    @override
     def native_value(self) -> float | None:
         cpu = (self._stats().get("metrics") or {}).get("cpuPercent")
         return round(cpu, 2) if cpu is not None else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         # cpu_count is host-level data from the slow coordinator (GET
         # /api/host) — consulted directly here rather than as a separate
@@ -751,7 +708,7 @@ class DockhandEnvCpuSensor(BaseFastEnvSensor):
 
         # top_containers — ranked from the same container_stats data the
         # per-container sensors use (see BaseFastContainerStatsSensor).
-        # Only populated when "Enable container stats" is on, since that
+        # Only populated when "Enable container and stack stats" is on, since that
         # option now gates the underlying API call itself, not just
         # whether the per-container entities are created — an empty list
         # here when the option is off is correct, not a bug.
@@ -793,11 +750,13 @@ class DockhandEnvMemPercentSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_mem_percent"
 
     @property
+    @override
     def native_value(self) -> float | None:
         mem = (self._stats().get("metrics") or {}).get("memoryPercent")
         return round(mem, 2) if mem is not None else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         m = self._stats().get("metrics") or {}
         used, total = m.get("memoryUsed"), m.get("memoryTotal")
@@ -832,10 +791,12 @@ class DockhandEnvContainerCountSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_containers_running"
 
     @property
+    @override
     def native_value(self) -> int | None:
         return (self._stats().get("containers") or {}).get("total")
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         c = self._stats().get("containers") or {}
         # Four related but distinct counts, kept structurally separate
@@ -901,19 +862,33 @@ class DockhandEnvContainerCountSensor(BaseFastEnvSensor):
         # subscribe to) — the fast coordinator's own interval is short
         # enough that this bounded delay isn't worth the complexity of
         # subscribing to two coordinators for one attribute.
+        pending_details = env_data.get("pending_update_details") or {}
         actionable_ids = _actionable_pending_update_container_ids(
-            env_containers, pending_ids, update_env_data
+            env_containers, pending_ids, update_env_data, pending_details
         )
         pending_with_update = sum(
             1
             for container in env_containers
             if _container_has_pending_update(container, pending_ids, update_env_data)
         )
-        pending_details = env_data.get("pending_update_details") or {}
         version_only = sum(
             1
             for container in env_containers
             if _container_has_version_suggestion_only(
+                container, pending_ids, pending_details, update_env_data
+            )
+        )
+        pinned_only = sum(
+            1
+            for container in env_containers
+            if _container_has_pinned_digest_only(
+                container, pending_ids, pending_details, update_env_data
+            )
+        )
+        held_only = sum(
+            1
+            for container in env_containers
+            if _container_has_held_update_only(
                 container, pending_ids, pending_details, update_env_data
             )
         )
@@ -926,7 +901,11 @@ class DockhandEnvContainerCountSensor(BaseFastEnvSensor):
             "pending_updates": len(actionable_ids),
             "pending_system_updates": pending_with_update - len(actionable_ids),
             "pending_version_updates": version_only,
-            "pending_updates_total": pending_with_update + version_only,
+            "pending_pinned_digest_updates": pinned_only,
+            "pending_held_updates": held_only,
+            "pending_updates_total": (
+                pending_with_update + version_only + pinned_only + held_only
+            ),
         }
 
 
@@ -947,10 +926,12 @@ class DockhandEnvStacksSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_stacks_total"
 
     @property
+    @override
     def native_value(self) -> int | None:
         return (self._stats().get("stacks") or {}).get("total")
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         s = self._stats().get("stacks") or {}
         return {
@@ -977,10 +958,12 @@ class DockhandEnvImagesSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_images_total"
 
     @property
+    @override
     def native_value(self) -> int | None:
         return (self._stats().get("images") or {}).get("total")
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         size = (self._stats().get("images") or {}).get("totalSize")
         return {
@@ -1005,10 +988,12 @@ class DockhandEnvVolumesSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_volumes_total"
 
     @property
+    @override
     def native_value(self) -> int | None:
         return (self._stats().get("volumes") or {}).get("total")
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         size = (self._stats().get("volumes") or {}).get("totalSize")
         return {
@@ -1033,6 +1018,7 @@ class DockhandEnvNetworksSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_networks_total"
 
     @property
+    @override
     def native_value(self) -> int | None:
         return (self._stats().get("networks") or {}).get("total")
 
@@ -1086,10 +1072,12 @@ class DockhandEnvDiskUsageSensor(BaseFastEnvSensor):
         )
 
     @property
+    @override
     def native_value(self) -> int:
         return sum(self._sizes())
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         images_size, volumes_size, containers_size, build_cache_size = self._sizes()
         return {
@@ -1134,10 +1122,12 @@ class DockhandEnvActivityEventsSensor(BaseFastEnvSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_events_total"
 
     @property
+    @override
     def native_value(self) -> int | None:
         return (self._stats().get("events") or {}).get("total")
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         e = self._stats().get("events") or {}
         slow_data = self._slow_coordinator.data or {}
@@ -1190,11 +1180,13 @@ class DockhandContainerStateSensor(BaseFastContainerSensor):
         )
 
     @property
+    @override
     def native_value(self) -> str | None:
         c = self._container()
         return c.get("state") if c else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         c = self._container()
         if not c:
@@ -1237,6 +1229,7 @@ class DockhandContainerHealthSensor(BaseFastContainerSensor):
         )
 
     @property
+    @override
     def native_value(self) -> str | None:
         c = self._container()
         return c.get("health") if c else None
@@ -1290,6 +1283,7 @@ class DockhandContainerCpuSensor(BaseFastContainerStatsSensor):
         )
 
     @property
+    @override
     def native_value(self) -> float | None:
         s = self._container_stats()
         if s is None:
@@ -1326,6 +1320,7 @@ class DockhandContainerMemoryUsageSensor(BaseFastContainerStatsSensor):
         )
 
     @property
+    @override
     def native_value(self) -> int | None:
         s = self._container_stats()
         if s is None:
@@ -1334,6 +1329,7 @@ class DockhandContainerMemoryUsageSensor(BaseFastContainerStatsSensor):
         return int(usage) if usage is not None else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         s = self._container_stats()
         if not s:
@@ -1368,6 +1364,7 @@ class DockhandContainerMemoryPercentSensor(BaseFastContainerStatsSensor):
         )
 
     @property
+    @override
     def native_value(self) -> float | None:
         s = self._container_stats()
         if s is None:
@@ -1407,6 +1404,7 @@ class DockhandContainerMemoryLimitSensor(BaseFastContainerStatsSensor):
         )
 
     @property
+    @override
     def native_value(self) -> int | None:
         s = self._container_stats()
         if s is None:
@@ -1443,6 +1441,7 @@ class DockhandContainerNetworkRxSensor(BaseFastContainerStatsSensor):
         )
 
     @property
+    @override
     def native_value(self) -> int | None:
         s = self._container_stats()
         if s is None:
@@ -1479,6 +1478,7 @@ class DockhandContainerNetworkTxSensor(BaseFastContainerStatsSensor):
         )
 
     @property
+    @override
     def native_value(self) -> int | None:
         s = self._container_stats()
         if s is None:
@@ -1515,6 +1515,7 @@ class DockhandContainerBlockReadSensor(BaseFastContainerStatsSensor):
         )
 
     @property
+    @override
     def native_value(self) -> int | None:
         s = self._container_stats()
         if s is None:
@@ -1551,6 +1552,7 @@ class DockhandContainerBlockWriteSensor(BaseFastContainerStatsSensor):
         )
 
     @property
+    @override
     def native_value(self) -> int | None:
         s = self._container_stats()
         if s is None:
@@ -1582,18 +1584,24 @@ class DockhandStackStatusSensor(BaseFastStackSensor):
         )
 
     @property
+    @override
     def native_value(self) -> str | None:
         s = self._stack()
         return s.get("status") if s else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         s = self._stack()
         if not s:
             return {}
         source_type = s.get("sourceType")
         type_map = {"internal": "Internal", "git": "Git", "external": "Untracked"}
-        type_label = type_map.get(source_type, "Untracked")
+        type_label = (
+            type_map.get(source_type, "Untracked")
+            if isinstance(source_type, str)
+            else "Untracked"
+        )
         # Dockhand's own "containers" field on a stack is a list of raw
         # container IDs (verified against Dockhand's source,
         # src/lib/server/stacks.ts), not names — resolved here against
@@ -1636,11 +1644,13 @@ class DockhandStackContainerCountSensor(BaseFastStackSensor):
         )
 
     @property
+    @override
     def native_value(self) -> int | None:
         s = self._stack()
         return len(s.get("containers") or []) if s else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         s = self._stack()
         if not s:
@@ -1684,6 +1694,7 @@ class BaseSlowEnvSensor(CoordinatorEntity[DockhandSlowCoordinator], SensorEntity
         return _coordinator_env(self.coordinator.data, self._env_id)
 
     @property
+    @override
     def available(self) -> bool:
         if not super().available:
             return False
@@ -1693,8 +1704,150 @@ class BaseSlowEnvSensor(CoordinatorEntity[DockhandSlowCoordinator], SensorEntity
         return self._fetch_failure_key not in failures
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _env_device(self._entry_id, self._env_id, self._env_name, self._base_url)
+
+
+# --------------------------------------------------------------------------- #
+# Fast coordinator — stack resource stats sensors
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, kw_only=True)
+class DockhandStackStatsDescription(SensorEntityDescription):
+    """One of Dockhand's own stack totals — `key` is its unique_id suffix,
+    the same as the matching container stats sensor's. There's no memory
+    percentage: Dockhand doesn't report one for a stack."""
+
+    value_fn: Callable[[dict[str, Any]], float | int | None]
+
+
+def _round2(value: Any) -> float | None:
+    return round(value, 2) if value is not None else None
+
+
+def _as_int(value: Any) -> int | None:
+    return int(value) if value is not None else None
+
+
+STACK_STATS_SENSORS: tuple[DockhandStackStatsDescription, ...] = (
+    DockhandStackStatsDescription(
+        key="cpu_percent",
+        translation_key="stack_cpu_percent",
+        native_unit_of_measurement="%",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda t: _round2(t.get("cpuPercent")),
+    ),
+    DockhandStackStatsDescription(
+        key="memory_usage",
+        translation_key="stack_memory_usage",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda t: _as_int(t.get("memoryUsage")),
+        device_class=SensorDeviceClass.DATA_SIZE,
+        native_unit_of_measurement=UnitOfInformation.BYTES,
+        suggested_unit_of_measurement=UnitOfInformation.MEBIBYTES,
+    ),
+    DockhandStackStatsDescription(
+        key="memory_limit",
+        translation_key="stack_memory_limit",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda t: _as_int(t.get("memoryLimit")),
+        device_class=SensorDeviceClass.DATA_SIZE,
+        native_unit_of_measurement=UnitOfInformation.BYTES,
+        suggested_unit_of_measurement=UnitOfInformation.MEBIBYTES,
+    ),
+    DockhandStackStatsDescription(
+        key="network_rx",
+        translation_key="stack_network_rx",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=lambda t: _as_int(t.get("networkRx")),
+        device_class=SensorDeviceClass.DATA_SIZE,
+        native_unit_of_measurement=UnitOfInformation.BYTES,
+        suggested_unit_of_measurement=UnitOfInformation.MEBIBYTES,
+    ),
+    DockhandStackStatsDescription(
+        key="network_tx",
+        translation_key="stack_network_tx",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=lambda t: _as_int(t.get("networkTx")),
+        device_class=SensorDeviceClass.DATA_SIZE,
+        native_unit_of_measurement=UnitOfInformation.BYTES,
+        suggested_unit_of_measurement=UnitOfInformation.MEBIBYTES,
+    ),
+    DockhandStackStatsDescription(
+        key="block_read",
+        translation_key="stack_block_read",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=lambda t: _as_int(t.get("blockRead")),
+        device_class=SensorDeviceClass.DATA_SIZE,
+        native_unit_of_measurement=UnitOfInformation.BYTES,
+        suggested_unit_of_measurement=UnitOfInformation.MEBIBYTES,
+    ),
+    DockhandStackStatsDescription(
+        key="block_write",
+        translation_key="stack_block_write",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=lambda t: _as_int(t.get("blockWrite")),
+        device_class=SensorDeviceClass.DATA_SIZE,
+        native_unit_of_measurement=UnitOfInformation.BYTES,
+        suggested_unit_of_measurement=UnitOfInformation.MEBIBYTES,
+    ),
+)
+
+
+class DockhandStackStatsSensor(BaseFastStackSensor):
+    """A stack's CPU/memory/network/block-I/O total, exactly as Dockhand
+    reports it (GET /api/stack-stats, 1.0.52+) — the stack-level
+    counterpart of the container stats sensors, created and removed with
+    the same "Enable container and stack stats" option, and only where Dockhand has
+    the endpoint. Unavailable while none of the stack's containers is
+    running (Dockhand leaves such a stack out), like a stopped container's
+    own stats sensors."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    entity_description: DockhandStackStatsDescription
+
+    def __init__(
+        self,
+        coordinator: DockhandFastCoordinator,
+        entry_id: str,
+        env_id: int,
+        env_name: str,
+        base_url: str,
+        stack: dict,
+        description: DockhandStackStatsDescription,
+    ) -> None:
+        super().__init__(coordinator, entry_id, env_id, env_name, base_url, stack)
+        self.entity_description = description
+        self._attr_unique_id = (
+            f"{entry_id}_{env_id}_stack_{self._stack_name}_{description.key}"
+        )
+
+    def _totals(self) -> dict[str, Any] | None:
+        stack_stats = _coordinator_env(self.coordinator.data, self._env_id).get(
+            "stack_stats"
+        )
+        return (stack_stats or {}).get(self._stack_name)
+
+    @property
+    @override
+    def available(self) -> bool:
+        return super().available and self._totals() is not None
+
+    @property
+    @override
+    def native_value(self) -> float | int | None:
+        totals = self._totals()
+        return self.entity_description.value_fn(totals) if totals else None
+
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
+        totals = self._totals()
+        if not totals or totals.get("runningCount") is None:
+            return {}
+        return {"running_containers": totals["runningCount"]}
 
 
 # --------------------------------------------------------------------------- #
@@ -1739,10 +1892,12 @@ class DockhandEnvHawserVersionSensor(BaseSlowEnvSensor):
         return (self._env_data().get("host") or {}).get("environment") or {}
 
     @property
+    @override
     def native_value(self) -> str | None:
         return self._host_env().get("hawserVersion")
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any] | None:
         if self._host_env().get("connectionType") != "hawser-edge":
             return None
@@ -1787,10 +1942,12 @@ class DockhandEnvVulnerabilitiesSensor(BaseSlowEnvSensor):
         return self._env_data().get("vulnerabilities") or {}
 
     @property
+    @override
     def native_value(self) -> int | None:
         return self._summary().get("total")
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         s = self._summary()
         return {
@@ -1843,10 +2000,12 @@ class DockhandEnvPlatformSensor(BaseSlowEnvHostSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_host_platform"
 
     @property
+    @override
     def native_value(self) -> str | None:
         return self._host().get("platform")
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         # architecture — folded in here rather than its own sensor, same
         # reasoning as cpu_count on the CPU usage sensor: one more static
@@ -1876,6 +2035,7 @@ class DockhandEnvDockerVersionSensor(BaseSlowEnvHostSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_host_docker_version"
 
     @property
+    @override
     def native_value(self) -> str | None:
         version = self._host().get("dockerVersion")
         # Reported as the literal string "unknown" for some connection
@@ -1919,7 +2079,8 @@ class DockhandEnvLastBootSensor(BaseSlowEnvHostSensor):
         self._attr_unique_id = f"{self._entry_id}_{env_id}_host_last_boot"
 
     @property
-    def native_value(self):
+    @override
+    def native_value(self) -> datetime | None:
         uptime_seconds = self._host().get("uptime")
         if not isinstance(uptime_seconds, int | float) or uptime_seconds < 0:
             return None
@@ -1974,11 +2135,12 @@ class DockhandImageSensor(BaseSlowEnvSensor):
         for img in self._env_data().get("images") or []:
             raw_id = img.get("id") or ""
             short_id = raw_id.split(":")[-1] if ":" in raw_id else raw_id
-            if short_id == self._image_id:
+            if short_id == self._image_id and isinstance(img, dict):
                 return img
         return None
 
     @property
+    @override
     def name(self) -> str:
         """Recomputed from live data on every access — NOT fixed at
         construction. The unique_id is hash-based and this entity object
@@ -2006,6 +2168,7 @@ class DockhandImageSensor(BaseSlowEnvSensor):
         return primary_tag.rsplit(":", 1)[0] if ":" in primary_tag else primary_tag
 
     @property
+    @override
     def native_value(self) -> str | None:
         """The tag portion of the primary tag, e.g. 'latest' or '2.1.0'."""
         img = self._image()
@@ -2014,10 +2177,11 @@ class DockhandImageSensor(BaseSlowEnvSensor):
         tags = [t for t in (img.get("repoTags") or []) if t and t != "<none>:<none>"]
         if not tags:
             return None  # untagged image — no meaningful tag value
-        primary = tags[0]
+        primary = str(tags[0])
         return primary.rsplit(":", 1)[1] if ":" in primary else primary
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         img = self._image()
         if not img:
@@ -2067,6 +2231,7 @@ class DockhandImageSensor(BaseSlowEnvSensor):
         return attrs
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         """All image entities live under the per-env Images group device."""
         return _image_group_device(
@@ -2110,16 +2275,18 @@ class DockhandNetworkSensor(BaseSlowEnvSensor):
 
     def _network(self) -> dict | None:
         for n in self._env_data().get("networks") or []:
-            if n.get("id") == self._network_id:
+            if isinstance(n, dict) and n.get("id") == self._network_id:
                 return n
         return None
 
     @property
+    @override
     def native_value(self) -> int | None:
         n = self._network()
         return len(n.get("containers") or {}) if n else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         n = self._network()
         if not n:
@@ -2139,6 +2306,7 @@ class DockhandNetworkSensor(BaseSlowEnvSensor):
         }
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         """All network entities live under the per-env Networks group device."""
         return _network_group_device(
@@ -2181,11 +2349,14 @@ class DockhandVolumeSensor(BaseSlowEnvSensor):
 
     def _volume(self) -> dict | None:
         for v in self._env_data().get("volumes") or []:
-            if (v.get("name") or v.get("Name")) == self._volume_name:
+            if (v.get("name") or v.get("Name")) == self._volume_name and isinstance(
+                v, dict
+            ):
                 return v
         return None
 
     @property
+    @override
     def native_value(self) -> int | None:
         """Container count — 0 means unused/dangling, a pruning candidate."""
         v = self._volume()
@@ -2195,6 +2366,7 @@ class DockhandVolumeSensor(BaseSlowEnvSensor):
         return len(used_by)
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         v = self._volume()
         if not v:
@@ -2220,6 +2392,7 @@ class DockhandVolumeSensor(BaseSlowEnvSensor):
         }
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         """All volume entities live under the per-env Volumes group device."""
         return _volume_group_device(
@@ -2259,11 +2432,16 @@ class _BaseScheduleSensor(CoordinatorEntity[DockhandSlowCoordinator], SensorEnti
 
     def _find(self) -> dict | None:
         for s in (self.coordinator.data or {}).get("schedules") or []:
-            if s["id"] == self._sched_id and s["type"] == self._sched_type:
+            if (
+                isinstance(s, dict)
+                and s["id"] == self._sched_id
+                and s["type"] == self._sched_type
+            ):
                 return s
         return None
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _sched_device(
             getattr(self, "hass", None),
@@ -2298,11 +2476,13 @@ class DockhandScheduleNextRunSensor(_BaseScheduleSensor):
         self._attr_unique_id = f"{self._entry_id}_sched_{_sched_key(sched)}_next_run"
 
     @property
+    @override
     def native_value(self) -> datetime | None:
         s = self._find()
         return _parse_dt(s.get("nextRun")) if s else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         s = self._find()
         if not s:
@@ -2354,6 +2534,7 @@ class DockhandScheduleLastStatusSensor(_BaseScheduleSensor):
         self._attr_unique_id = f"{self._entry_id}_sched_{_sched_key(sched)}_last_status"
 
     @property
+    @override
     def native_value(self) -> str | None:
         s = self._find()
         if s:
@@ -2362,6 +2543,7 @@ class DockhandScheduleLastStatusSensor(_BaseScheduleSensor):
         return None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         s = self._find()
         if not s:
@@ -2421,15 +2603,11 @@ class BaseSlowGitStackSensor(CoordinatorEntity[DockhandSlowCoordinator], SensorE
         self._base_url = base_url
         self._stack_name = git_stack.get("stackName", "")
 
-    def _git_stack(self) -> dict | None:
-        slow_data = self.coordinator.data or {}
-        env = _coordinator_env(slow_data, self._env_id)
-        for gs in env.get("git_stacks") or []:
-            if gs.get("stackName") == self._stack_name:
-                return gs
-        return None
+    def _git_stack(self) -> dict[str, Any] | None:
+        return _find_git_stack(self.coordinator.data, self._env_id, self._stack_name)
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _stack_device(
             getattr(self, "hass", None),
@@ -2449,18 +2627,20 @@ class DockhandGitStackSyncStatusSensor(BaseSlowGitStackSensor):
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = ["pending", "syncing", "synced", "error"]
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._attr_unique_id = (
             f"{self._entry_id}_{self._env_id}_stack_{self._stack_name}_git_sync_status"
         )
 
     @property
+    @override
     def native_value(self) -> str | None:
         gs = self._git_stack()
         return gs.get("syncStatus") if gs else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         gs = self._git_stack()
         if not gs:
@@ -2479,13 +2659,14 @@ class DockhandGitStackLastSyncSensor(BaseSlowGitStackSensor):
     _attr_translation_key = "git_stack_last_sync"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._attr_unique_id = (
             f"{self._entry_id}_{self._env_id}_stack_{self._stack_name}_git_last_sync"
         )
 
     @property
+    @override
     def native_value(self) -> datetime | None:
         gs = self._git_stack()
         return _parse_dt(gs.get("lastSync")) if gs else None

@@ -41,14 +41,16 @@ warning means part of the request may not have been applied as asked.
 """
 
 import logging
-from typing import Any
+from collections.abc import Callable, Coroutine
+from datetime import datetime
+from typing import Any, override
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.const import EntityCategory, UnitOfInformation
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -83,7 +85,7 @@ async def async_setup_entry(
     data = entry.runtime_data
 
     def _opt(key: str, default: Any) -> Any:
-        return entry.options.get(key, entry.data.get(key, default))
+        return entry.options.get(key, default)
 
     if not _opt(CONF_ENABLE_RUNTIME_CONTROLS, False):
         return
@@ -204,12 +206,14 @@ class _BaseRuntimeControlNumber(
         return (env.get("runtime_config") or {}).get(self._container_name) or {}
 
     @property
+    @override
     def available(self) -> bool:
         if self._container() is None or not super().available:
             return False
         env = _coordinator_env(self.coordinator.data, self._env_id)
         return "runtime_config" not in (env.get("fetch_failures") or set())
 
+    @override
     def _handle_coordinator_update(self) -> None:
         # A real poll result supersedes any optimistic value we set locally.
         self._optimistic_value = None
@@ -268,25 +272,38 @@ class DockhandContainerMemoryLimitNumber(_BaseRuntimeControlNumber):
     _attr_native_max_value = 1_099_511_627_776  # 1 TiB — a practical ceiling
     _attr_native_step = 1_048_576  # 1 MiB
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._attr_unique_id = (
             f"{self._entry_id}_{self._env_id}_container_"
             f"{self._container_name}_memory_limit"
         )
-        self._cancel_safety_check = None
+        self._cancel_safety_check: Callable[[], None] | None = None
 
+    @override
     async def async_will_remove_from_hass(self) -> None:
         if self._cancel_safety_check is not None:
             self._cancel_safety_check()
             self._cancel_safety_check = None
 
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        # Nothing here is keyed on entity_id, so a rename can happen in
+        # place (HA 2026.11+) instead of removing and re-adding the entity,
+        # which defining async_will_remove_from_hass otherwise forces. Only
+        # ever called by HA versions that have this method, which is also
+        # why mypy (checking against an older one) can't see it yet.
+        super().async_entity_id_changed(old_entity_id)  # type: ignore[misc, unused-ignore]
+
     @property
+    @override
     def native_value(self) -> float | None:
         if self._optimistic_value is not None:
             return self._optimistic_value
-        return self._runtime_config().get("memory")
+        memory = self._runtime_config().get("memory")
+        return float(memory) if memory is not None else None
 
+    @override
     async def async_set_native_value(self, value: float) -> None:
         new_memory = int(value)
         previous = self._runtime_config().get("memory") or 0
@@ -305,8 +322,10 @@ class DockhandContainerMemoryLimitNumber(_BaseRuntimeControlNumber):
                 self._async_check_and_revert(previous),
             )
 
-    def _async_check_and_revert(self, previous_memory: int):
-        async def _check(_now) -> None:
+    def _async_check_and_revert(
+        self, previous_memory: int
+    ) -> Callable[[datetime], Coroutine[Any, Any, None]]:
+        async def _check(_now: datetime) -> None:
             self._cancel_safety_check = None
             c = self._container()
             if c is None or c.get("state") == "running":
@@ -359,7 +378,7 @@ class DockhandContainerCpuLimitNumber(_BaseRuntimeControlNumber):
     _attr_native_min_value = 0
     _attr_native_step = 0.1
 
-    def __init__(self, *args, host_cpus: int | None = None, **kwargs) -> None:
+    def __init__(self, *args: Any, host_cpus: int | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._attr_unique_id = (
             f"{self._entry_id}_{self._env_id}_container_"
@@ -371,14 +390,16 @@ class DockhandContainerCpuLimitNumber(_BaseRuntimeControlNumber):
         self._attr_native_max_value = float(host_cpus) if host_cpus else 64.0
 
     @property
+    @override
     def native_value(self) -> float | None:
         if self._optimistic_value is not None:
             return self._optimistic_value
         nano_cpus = self._runtime_config().get("nano_cpus")
         if nano_cpus is None:
             return None
-        return round(nano_cpus / 1_000_000_000, 2)
+        return round(float(nano_cpus) / 1_000_000_000, 2)
 
+    @override
     async def async_set_native_value(self, value: float) -> None:
         nano_cpus = int(value * 1_000_000_000)
         await self._async_apply("NanoCpus", nano_cpus)
@@ -398,7 +419,7 @@ class DockhandContainerPidsLimitNumber(_BaseRuntimeControlNumber):
     _attr_native_max_value = 100_000
     _attr_native_step = 1
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._attr_unique_id = (
             f"{self._entry_id}_{self._env_id}_container_"
@@ -406,12 +427,14 @@ class DockhandContainerPidsLimitNumber(_BaseRuntimeControlNumber):
         )
 
     @property
+    @override
     def native_value(self) -> float | None:
         if self._optimistic_value is not None:
             return self._optimistic_value
         pids_limit = self._runtime_config().get("pids_limit")
         return float(pids_limit) if pids_limit is not None else None
 
+    @override
     async def async_set_native_value(self, value: float) -> None:
         pids_limit = int(value)
         await self._async_apply("PidsLimit", pids_limit)

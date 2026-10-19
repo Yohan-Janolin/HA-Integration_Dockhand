@@ -1,30 +1,31 @@
-from typing import Any
+from typing import Any, override
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import DockhandConfigEntry
 from .const import CONF_API_URL
 from .coordinator import DockhandFastCoordinator, DockhandSlowCoordinator
+from .entity import DockhandContainerEntity, DockhandStackEntity
 from .helpers import (
     _all_envs,
     _compose_project,
     _container_device,
     _coordinator_env,
     _find_container,
-    _find_stack,
+    _find_git_stack,
     _stack_device,
     _stack_has_system_container,
     already_registered,
 )
 
-# Coordinator-based platform. 0 = no HA-level parallel update limit;
-# the coordinator serialises data access.
+# Reads come from the coordinators. Actions aren't limited: each is one
+# request to Dockhand, which queues the Docker work itself.
 PARALLEL_UPDATES = 0
 
 
@@ -70,7 +71,7 @@ async def async_setup_entry(
                 new.append(running_switch)
 
             for stack in env_data.get("stacks") or []:
-                if _stack_has_system_container(stack, env_data.get("containers")):
+                if _stack_has_system_container(stack, env_data.get("containers") or []):
                     continue
                 stack_switch = DockhandStackRunningSwitch(
                     fast,
@@ -175,13 +176,9 @@ async def async_setup_entry(
     )
 
 
-class _BaseFastContainerSwitch(
-    CoordinatorEntity[DockhandFastCoordinator], SwitchEntity
-):
+class _BaseFastContainerSwitch(DockhandContainerEntity, SwitchEntity):
     """Common base for per-container switches."""
 
-    _attr_has_entity_name = True
-
     def __init__(
         self,
         coordinator: DockhandFastCoordinator,
@@ -190,40 +187,15 @@ class _BaseFastContainerSwitch(
         env_id: int,
         env_name: str,
         base_url: str,
-        container: dict,
+        container: dict[str, Any],
     ) -> None:
-        super().__init__(coordinator)
+        super().__init__(coordinator, entry_id, env_id, env_name, base_url, container)
         self._client = client
-        self._entry_id = entry_id
-        self._env_id = env_id
-        self._env_name = env_name
-        self._base_url = base_url
-        self._container_name = container.get("name", "")
-
-    def _container(self) -> dict | None:
-        return _find_container(
-            self.coordinator.data, self._env_id, self._container_name
-        )
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        c = self._container()
-        return _container_device(
-            getattr(self, "hass", None),
-            self._entry_id,
-            self._container_name,
-            self._env_id,
-            self._env_name,
-            self._base_url,
-            _compose_project(c),
-        )
 
 
-class _BaseFastStackSwitch(CoordinatorEntity[DockhandFastCoordinator], SwitchEntity):
+class _BaseFastStackSwitch(DockhandStackEntity, SwitchEntity):
     """Common base for per-stack switches."""
 
-    _attr_has_entity_name = True
-
     def __init__(
         self,
         coordinator: DockhandFastCoordinator,
@@ -232,31 +204,10 @@ class _BaseFastStackSwitch(CoordinatorEntity[DockhandFastCoordinator], SwitchEnt
         env_id: int,
         env_name: str,
         base_url: str,
-        stack: dict,
+        stack: dict[str, Any],
     ) -> None:
-        super().__init__(coordinator)
+        super().__init__(coordinator, entry_id, env_id, env_name, base_url, stack)
         self._client = client
-        self._entry_id = entry_id
-        self._env_id = env_id
-        self._env_name = env_name
-        self._base_url = base_url
-        self._stack_name = stack.get("name", "")
-
-    def _stack(self) -> dict | None:
-        return _find_stack(self.coordinator.data, self._env_id, self._stack_name)
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        s = self._stack()
-        return _stack_device(
-            getattr(self, "hass", None),
-            self._entry_id,
-            self._stack_name,
-            self._env_id,
-            self._env_name,
-            self._base_url,
-            source_type=(s or {}).get("sourceType"),
-        )
 
 
 class DockhandContainerRunningSwitch(_BaseFastContainerSwitch):
@@ -286,10 +237,12 @@ class DockhandContainerRunningSwitch(_BaseFastContainerSwitch):
         )
 
     @property
+    @override
     def is_on(self) -> bool:
         c = self._container()
         return c.get("state") == "running" if c else False
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         c = self._container()
         if not c:
@@ -311,6 +264,7 @@ class DockhandContainerRunningSwitch(_BaseFastContainerSwitch):
         # reasoning applies to every async_refresh() call in this file.
         await self.coordinator.async_refresh()
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         c = self._container()
         if not c:
@@ -355,10 +309,12 @@ class DockhandStackRunningSwitch(_BaseFastStackSwitch):
         )
 
     @property
+    @override
     def is_on(self) -> bool:
         s = self._stack()
         return s.get("status") in ("running", "partial") if s else False
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         try:
             await self._client.async_start_stack(self._env_id, self._stack_name)
@@ -370,6 +326,7 @@ class DockhandStackRunningSwitch(_BaseFastStackSwitch):
             ) from err
         await self.coordinator.async_refresh()
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         try:
             await self._client.async_stop_stack(self._env_id, self._stack_name)
@@ -434,17 +391,20 @@ class DockhandContainerAutoUpdateSwitch(
         )
 
     @property
+    @override
     def available(self) -> bool:
         if self._container() is None or not super().available:
             return False
         env = _coordinator_env(self.coordinator.data, self._env_id)
         return "auto_update_settings" not in (env.get("fetch_failures") or set())
 
+    @override
     def _handle_coordinator_update(self) -> None:
         self._optimistic_value = None
         super()._handle_coordinator_update()
 
     @property
+    @override
     def is_on(self) -> bool | None:
         if self._optimistic_value is not None:
             return self._optimistic_value
@@ -474,13 +434,16 @@ class DockhandContainerAutoUpdateSwitch(
         self._optimistic_value = enabled
         self.async_write_ha_state()
 
-    async def async_turn_on(self, **kwargs) -> None:
+    @override
+    async def async_turn_on(self, **kwargs: Any) -> None:
         await self._async_set(True)
 
-    async def async_turn_off(self, **kwargs) -> None:
+    @override
+    async def async_turn_off(self, **kwargs: Any) -> None:
         await self._async_set(False)
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         c = self._container()
         return _container_device(
@@ -531,19 +494,16 @@ class DockhandGitStackAutoUpdateSwitch(
             f"{entry_id}_{env_id}_stack_{self._stack_name}_git_auto_deploy"
         )
 
-    def _git_stack(self) -> dict | None:
-        slow_data = self.coordinator.data or {}
-        env = _coordinator_env(slow_data, self._env_id)
-        for gs in env.get("git_stacks") or []:
-            if gs.get("stackName") == self._stack_name:
-                return gs
-        return None
+    def _git_stack(self) -> dict[str, Any] | None:
+        return _find_git_stack(self.coordinator.data, self._env_id, self._stack_name)
 
+    @override
     def _handle_coordinator_update(self) -> None:
         self._optimistic_value = None
         super()._handle_coordinator_update()
 
     @property
+    @override
     def is_on(self) -> bool | None:
         if self._optimistic_value is not None:
             return self._optimistic_value
@@ -568,13 +528,16 @@ class DockhandGitStackAutoUpdateSwitch(
         self._optimistic_value = enabled
         self.async_write_ha_state()
 
-    async def async_turn_on(self, **kwargs) -> None:
+    @override
+    async def async_turn_on(self, **kwargs: Any) -> None:
         await self._async_set(True)
 
-    async def async_turn_off(self, **kwargs) -> None:
+    @override
+    async def async_turn_off(self, **kwargs: Any) -> None:
         await self._async_set(False)
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _stack_device(
             getattr(self, "hass", None),

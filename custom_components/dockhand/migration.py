@@ -1,38 +1,53 @@
-"""migration.py — one-time data migrations run at setup time.
+"""migration.py — one-time entity and device registry migrations, run at setup.
 
-Each function is named after the version whose data format it targets.
-When a migration is retired (old installs no longer plausible), delete
-the function and remove it from async_run_migrations. If there are no
-active migrations, async_run_migrations returns immediately.
+Each function is named after the release whose registry format it updates
+from. They're only for changes between released versions (e.g. 1.7.3 ->
+1.8.0) — never for churn within an unreleased dev cycle (an entity added
+and removed before ever shipping): Raetha's own testing reloads or re-adds
+the integration, so a migration for interim-build-only artifacts adds
+permanent maintenance cost for zero real benefit.
 
-Active migrations:
-  migrate_1_4_0_update_entity_unique_ids            — retire after ~1.10.0
-  migrate_1_5_0_container_device_identifiers        — retire after ~1.10.0
-  migrate_1_7_3_entry_scoped_unique_ids             — retire after ~1.11.0
-  migrate_1_8_0_container_stats_option              — retire after ~1.11.0
-  migrate_1_8_0_reenable_container_stats_entities   — retire after ~1.11.0
-  migrate_1_8_0_remove_consolidated_disk_sensors    — retire after ~1.11.0
-  migrate_1_9_0_entry_scoped_device_identifiers     — retire after ~1.12.0
-
-Migrations are for entity/device registry changes between released
-versions only (e.g. 1.7.3 -> 1.8.0) — never add one for churn within an
-unreleased dev cycle (an entity added and removed before ever shipping).
-Raetha's own testing doesn't rely on these at all (she reloads/re-adds
-the integration during development), so a migration for interim-build-only
-artifacts adds permanent maintenance cost for zero real benefit.
+How long each is kept follows the config schema rules (see RenamedOption
+in const.py and docs/ARCHITECTURE.md §4): REGISTRY_MIGRATIONS records the
+config schema major of the releases each one upgrades *from*. An entry
+from more than one schema major back can't be set up at all
+(async_migrate_entry refuses it), and every newer entry already went
+through the migration when it was upgraded, so once the schema major is
+two past that, a migration can never do anything again. It stops running
+then, and tests/test_migration.py fails until it's deleted.
 """
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
-from .const import CONF_ENABLE_CONTAINER_STATS, DOMAIN
-from .helpers import CONTAINER_STATS_SUFFIXES
+from .const import CONF_ENABLE_RESOURCE_STATS, DOMAIN, SCHEMA_VERSION
+from .helpers import CONTAINER_STATS_SUFFIXES, _device_by_identifier
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RegistryMigration:
+    """A registry migration in `release`, for registries left by releases
+    on config schema major `from_major` — see the module docstring for
+    what that decides."""
+
+    release: str
+    from_major: int
+    run: Callable[[HomeAssistant, ConfigEntry, dict], None]
+
+
+def registry_migrations_to_run(
+    schema_major: int = SCHEMA_VERSION,
+) -> list[RegistryMigration]:
+    """The migrations an entry this code can set up might still need."""
+    return [m for m in REGISTRY_MIGRATIONS if m.from_major >= schema_major - 1]
 
 
 def async_run_migrations(
@@ -40,7 +55,7 @@ def async_run_migrations(
     entry: ConfigEntry,
     fast_data: dict,
 ) -> None:
-    """Run all active one-time migrations in order.
+    """Run the registry migrations still in use, oldest first.
 
     Called once from async_setup_entry after the fast coordinator's first
     refresh, before platforms are set up — so any option this changes
@@ -48,22 +63,12 @@ def async_run_migrations(
     time sensor.py reads it. Each migration is idempotent — it detects
     whether it has anything to do and returns immediately if not.
 
-    To add a migration: define a new migrate_X_Y_Z_* function below and
-    call it here. Only for changes between released versions — see module
-    docstring.
-
-    To retire a migration: delete the function and remove its call from
-    this function. If no migrations remain, this function body should be
-    just `pass` — do not delete the function itself, as __init__.py
-    imports and calls it unconditionally.
+    To add one: write a migrate_X_Y_Z_* function below and add it to
+    REGISTRY_MIGRATIONS, with the schema major of the releases it upgrades
+    from (normally the current SCHEMA_VERSION).
     """
-    migrate_1_4_0_update_entity_unique_ids(hass, entry.entry_id, fast_data)
-    migrate_1_5_0_container_device_identifiers(hass, entry.entry_id, fast_data)
-    migrate_1_7_3_entry_scoped_unique_ids(hass, entry.entry_id)
-    migrate_1_8_0_container_stats_option(hass, entry)
-    migrate_1_8_0_reenable_container_stats_entities(hass, entry)
-    migrate_1_8_0_remove_consolidated_disk_sensors(hass, entry)
-    migrate_1_9_0_entry_scoped_device_identifiers(hass, entry.entry_id)
+    for migration in registry_migrations_to_run():
+        migration.run(hass, entry, fast_data)
 
 
 def _is_hex64(s: str) -> bool:
@@ -269,8 +274,6 @@ def migrate_1_7_3_entry_scoped_unique_ids(
         # Strip the "dockhand_" prefix to get "{type}_{rest}"
         without_prefix = uid[len("dockhand_") :]
         parts = without_prefix.split("_", 2)
-        if not parts:
-            continue
         type_word = parts[0]
 
         if type_word == "sched":
@@ -338,7 +341,7 @@ def migrate_1_8_0_container_stats_option(
     the option is set (by this migration or by the user), it's always
     present in options going forward, so this becomes a no-op.
     """
-    if CONF_ENABLE_CONTAINER_STATS in entry.options:
+    if CONF_ENABLE_RESOURCE_STATS in entry.options:
         return  # Already decided, either by the user or a prior run of this.
 
     ent_registry = er.async_get(hass)
@@ -354,7 +357,7 @@ def migrate_1_8_0_container_stats_option(
         return
 
     hass.config_entries.async_update_entry(
-        entry, options={**entry.options, CONF_ENABLE_CONTAINER_STATS: True}
+        entry, options={**entry.options, CONF_ENABLE_RESOURCE_STATS: True}
     )
     _LOGGER.info(
         "Dockhand: found manually-enabled container stats sensor(s) from before "
@@ -536,7 +539,7 @@ def migrate_1_9_0_entry_scoped_device_identifiers(
                 (
                     d
                     for ident in new_identifiers
-                    if (d := dev_registry.async_get_device(identifiers={ident}))
+                    if (d := _device_by_identifier(dev_registry, ident, entry_id))
                     and d.id != device.id
                 ),
                 None,
@@ -565,3 +568,55 @@ def migrate_1_9_0_entry_scoped_device_identifiers(
             migrated,
             entry_id[:8],
         )
+
+
+# Config schema 1 was current up to 1.7.x; 1.8.0 introduced schema 2.
+REGISTRY_MIGRATIONS: tuple[RegistryMigration, ...] = (
+    RegistryMigration(
+        "1.4.0",
+        1,
+        lambda hass, entry, fast: migrate_1_4_0_update_entity_unique_ids(
+            hass, entry.entry_id, fast
+        ),
+    ),
+    RegistryMigration(
+        "1.5.0",
+        1,
+        lambda hass, entry, fast: migrate_1_5_0_container_device_identifiers(
+            hass, entry.entry_id, fast
+        ),
+    ),
+    RegistryMigration(
+        "1.7.3",
+        1,
+        lambda hass, entry, fast: migrate_1_7_3_entry_scoped_unique_ids(
+            hass, entry.entry_id
+        ),
+    ),
+    RegistryMigration(
+        "1.8.0",
+        1,
+        lambda hass, entry, fast: migrate_1_8_0_container_stats_option(hass, entry),
+    ),
+    RegistryMigration(
+        "1.8.0",
+        1,
+        lambda hass, entry, fast: migrate_1_8_0_reenable_container_stats_entities(
+            hass, entry
+        ),
+    ),
+    RegistryMigration(
+        "1.8.0",
+        1,
+        lambda hass, entry, fast: migrate_1_8_0_remove_consolidated_disk_sensors(
+            hass, entry
+        ),
+    ),
+    RegistryMigration(
+        "1.9.0",
+        2,
+        lambda hass, entry, fast: migrate_1_9_0_entry_scoped_device_identifiers(
+            hass, entry.entry_id
+        ),
+    ),
+)

@@ -3,7 +3,9 @@
 #
 # Usage:
 #   bash scripts/run_tests.sh                        # lint + AST only (no HA required)
-#   bash scripts/run_tests.sh --full                 # full test suite (requires Python 3.14.2+)
+#   bash scripts/run_tests.sh --full                 # + mypy, quality scale rule check, and
+#                                                    # the full test suite with a 100%
+#                                                    # coverage gate (requires Python 3.14.2+)
 #
 # Both modes use an isolated venv created automatically on first run:
 #   Default:  .venv-sandbox  (ruff + pytest stubs, no homeassistant)
@@ -78,7 +80,7 @@ source "$VENV/bin/activate"
 PYTHON="$VENV/bin/python"
 
 PY_VERSION=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null || echo "unknown")
-STEPS=$([[ $FULL -eq 1 ]] && echo 4 || echo 3)
+STEPS=$([[ $FULL -eq 1 ]] && echo 6 || echo 3)
 
 echo "========================================"
 echo " Dockhand test runner"
@@ -123,11 +125,25 @@ PYEOF
 AST_EXIT=$?
 [[ $AST_EXIT -ne 0 ]] && FAILED=1
 
-# ── Step 4: pytest (full mode only) ──────────────────────────────────────────
+# ── Steps 4-6: full mode only ────────────────────────────────────────────────
 if [[ $FULL -eq 1 ]]; then
-    echo "[ 4/$STEPS ] pytest tests/ (full suite)..."
+    # Strict typing, with Home Assistant core's own settings (mypy.ini) —
+    # the quality scale's strict-typing rule. Needs the pinned HA installed.
+    echo "[ 4/$STEPS ] mypy (strict, Home Assistant core settings)..."
+    "$PYTHON" -m mypy && echo "        PASS" || { echo "        FAIL"; FAILED=1; }
+
+    # Home Assistant's current quality scale rules vs quality_scale.yaml.
+    # Fetches core's rule list from GitHub. See docs/QUALITY_SCALE.md.
+    echo "[ 5/$STEPS ] quality scale rules (vs Home Assistant core dev)..."
+    "$PYTHON" scripts/check_quality_scale.py && echo "        PASS" || { echo "        FAIL"; FAILED=1; }
+
+    # Coverage gate. The quality scale's test-coverage rule asks for 95%;
+    # every line is covered, and the gate keeps it that way.
+    echo "[ 6/$STEPS ] pytest tests/ (full suite, 100% line coverage)..."
     # shellcheck disable=SC2086
-    "$PYTHON" -m pytest tests/ --tb=short $PYTEST_EXTRA_ARGS \
+    "$PYTHON" -m pytest tests/ --tb=short \
+        --cov=custom_components/dockhand --cov-report=term-missing:skip-covered \
+        --cov-fail-under=100 $PYTEST_EXTRA_ARGS \
         && echo "        PASS" || { echo "        FAIL"; FAILED=1; }
 fi
 

@@ -7,6 +7,18 @@ the reasoning first and only revisit if the stated condition has changed.
 
 ## Deferred
 
+- **Drop the pre-2026.10 typing workarounds once the minimum Home Assistant
+  version reaches 2026.10.** That release switched form schemas to probatio
+  (aliasing `import voluptuous` to it at runtime) and moved
+  `BinarySensorDeviceClass` to `homeassistant.components.binary_sensor.const`.
+  The minimum (2026.3) has neither, so `config_flow.py` keeps voluptuous and
+  passes schemas through `_form()`, and `binary_sensor.py`'s import carries a
+  `type: ignore`. At 2026.10+: build the schemas with probatio directly,
+  delete `_form()`, and import from `binary_sensor.const`. Likewise
+  `number.py`'s `async_entity_id_changed` ignore once the minimum reaches
+  2026.11 (where it becomes an ordinary `@override`). See
+  `docs/QUALITY_SCALE.md`.
+
 - **Inline release-notes body content (not just a link) for floating-tag
   images with no Dockhand `newerVersion` suggestion** — e.g. AudiobookShelf
   (`ghcr.io/advplyr/audiobookshelf:latest`) shows a "View release notes"
@@ -109,7 +121,7 @@ the reasoning first and only revisit if the stated condition has changed.
   its owning environment's Schedules group like any other env-scoped
   schedule.
 
-- **Group `enable_update_entities`/`enable_precise_updates`/`poll_interval_updates`
+- **Group `enable_update_entities`/`enable_precise_updates`/`poll_interval_precise_updates`
   visually via HA's `section()` helper in the Configure form.** Tried twice in the
   unreleased 1.8.1 dev cycle (once with the three fields' `strings.json` labels
   nested under the section's own key, once flat at the top level) — both times the
@@ -119,141 +131,29 @@ the reasoning first and only revisit if the stated condition has changed.
   strongly suggested the flat structure should be right, but it wasn't, and there's
   no way to render/verify HA's actual frontend from this environment. Reverted
   rather than keep fighting it blind — `_options_schema()` is back to fully flat
-  fields, `DockhandConfigFlow.VERSION` back to 2 (the brief 2 -> 3 migration for
-  this was deleted outright; nothing ever shipped at version 3). Revisit only with
+  fields, and its brief config entry migration was deleted outright (nothing
+  shipped with it; 1.11.0's schema 2.2 is an unrelated, real rename). Revisit only with
   a way to actually verify rendering — e.g. a confirmed-working real HA integration
   using `section()` to copy the exact translation structure from, or some way to
   render/test the actual frontend rather than guessing from source reading.
 
-- **Deprecate `DockhandUpdateCoordinator` (Tier 2 / `CONF_ENABLE_PRECISE_UPDATES`)
-  in a future major release.** After the 1.10.0 update-entity rework, Tier 1
-  (the always-on `pending-updates` poll) already carries `hasImageUpdate`/
-  `newerVersion` sourced from a real registry digest check — Dockhand's own
-  scheduled job (`env-update-check.ts`) computes that via the same
-  `checkImageUpdateAvailable()` call Tier 2's interactive `check-updates` POST
-  uses, just on Dockhand's own cron instead of ours. So Tier 2 no longer adds
-  a new "is there an update" signal for ordinary containers — confirmed by
-  reading both `env-update-check.ts` and `check-updates/+server.ts` directly,
-  not assumed.
-  **However, do not remove Tier 2 without solving this first:** Dockhand
-  deliberately never persists a `pending_container_updates` row for a system
-  container (Hawser, Dockhand itself) — both `env-update-check.ts`
-  (`if (isSystemContainer(imageName)) continue`) and the interactive
-  check-updates route (`if (result.systemContainer || result.updateDisabled)
-  continue`) skip writing that row, since Dockhand's own UI intentionally
-  hides system-container updates from the normal container-update flow. This
-  means Tier 1's `pending-updates` cache can **never** carry update status
-  for Hawser/Dockhand's own update entities, no matter how it's polled or
-  improved — that data simply doesn't exist server-side outside the raw,
-  unpersisted POST response. Tier 2's `DockhandUpdateCoordinator` captures
-  that raw response in memory (indexed by container ID, no system-container
-  filter applied client-side), which is the *only* reason our Hawser/Dockhand
-  update entities can ever show "update available" today. Confirmed live:
-  disabling `enable_precise_updates` makes those two entities permanently
-  read as up to date, even when an update genuinely exists.
-  Real remaining value of Tier 2, in order: (1) system-container update
-  detection above — a hard blocker on removal as things stand; (2) a
-  registry check on our own configurable cadence rather than Dockhand's
-  per-environment schedule; (3) the real short digest string for display,
-  which the maintainer has said isn't valuable on its own. The manual
-  "Check for updates" button stays regardless of this coordinator's fate —
-  it's independently useful and not the thing being reconsidered here.
-  Revisit if/when Dockhand adds a way to read system-container update status
-  from a cached/persisted endpoint (so Tier 1 could pick it up directly), or
-  if the maintainer decides losing accurate Hawser/Dockhand update entities
-  is an acceptable trade for removing the option.
-
-- **`async_get_device_by_identifier` / `async_get_device` migration
-  (target: 2.0.0, Major — raises HA floor to 2026.8.0).** HA 2026.8
-  deprecated `dr.async_get(hass).async_get_device(identifiers=...)` in
-  favour of two new scoped lookups (announced at
-  https://developers.home-assistant.io/blog/2026/07/21/device-registry-single-config-entry/).
-  The integration is deliberately staying on the old API for 1.x so the
-  HA minimum stays at 2026.3.0, but the old API is marked
-  `breaks_in_ha_version="2027.8.0"` — so the migration **must** land
-  before 2.0.0 ships. Per SEMVER.md, raising the HA floor is a Major
-  change, and per the floor rule, `ha-dockhand-cards` minimum must be
-  raised to match in the same release.
-
-  **Full implementation plan (do not reinvent):**
-
-  1. **`helpers.py` — `_device_entry_id` function.** Change the
-     2-argument signature `(hass, identifier)` to 3 arguments
-     `(hass, identifier, config_entry_id)` and swap the lookup:
-
-     ```python
-     # Before (1.x — deprecated):
-     device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, identifier)})
-
-     # After (2.0.0 — HA 2026.8+):
-     device = dr.async_get(hass).async_get_device_by_identifier(
-         (DOMAIN, identifier), config_entry_id
-     )
-     ```
-
-     `async_get_device_by_identifier` is O(1) (keyed by `(identifier,
-     config_entry_id)`) and scoped to the config entry, which is
-     semantically correct since every device this integration registers
-     belongs to exactly one config entry.
-
-  2. **All 9 call sites in `helpers.py`** — add `entry_id` (or the
-     relevant `config_entry_id`/`entry.entry_id`) as the third argument.
-     The nine sites are:
-
-     - `_device_entry_id(hass, _device_id_env(entry_id, env_id))` — 6
-       occurrences → `_device_entry_id(hass, _device_id_env(entry_id, env_id), entry_id)`
-     - `_device_entry_id(hass, _device_id_stacks_group(entry_id, env_id))` — 1
-       occurrence → `..., entry_id)`
-     - `_device_entry_id(hass, parent_identifier)` — 2 occurrences →
-       `_device_entry_id(hass, parent_identifier, entry_id)` (the
-       `entry_id` is already in scope at both call sites)
-
-  3. **`tests/test_helpers.py` — `mock_dr` fixture.** Swap the mocked
-     method from `async_get_device` to `async_get_device_by_identifier`.
-     The new API takes a positional `(DOMAIN, identifier)` tuple and a
-     positional `config_entry_id` string (no keyword args); adjust the
-     fixture's inner function accordingly:
-
-     ```python
-     def _async_get_device_by_identifier(identifier_tuple, _config_entry_id=None):
-         key = identifier_tuple[1]          # second element of (DOMAIN, key)
-         if key in registry_map:
-             dev = MagicMock()
-             dev.id = registry_map[key]
-             return dev
-         return None
-
-     mock_reg.async_get_device_by_identifier = _async_get_device_by_identifier
-     ```
-
-  4. **`hacs.json`** — bump `"homeassistant"` from `"2026.3.0"` to
-     `"2026.8.0"`.
-
-  5. **`manifest.json`** — no change needed (no explicit HA version
-     floor declared there).
-
-  6. **Version bump** — `manifest.json` `"version"` from `1.9.x` to
-     `"2.0.0"`. Also update `CHANGELOG.md`.
-
-  7. **`ha-dockhand-cards`** — per SEMVER.md floor rule, update its
-     minimum HA version to 2026.8.0 in the same release.
-
-  8. **`UnitOfRatio.PERCENTAGE`** (see item below) — can be bundled
-     into 2.0.0 at the same time, since that item also requires the HA
-     minimum to be bumped past 2026.7.
-
-  *Why not `async_get_devices` (plural)?* That API was also introduced
-  in HA 2026.8 and returns a *list* of matching devices across all config
-  entries. The singular `async_get_device_by_identifier` is the right
-  choice: scoped to one config entry, single return value, O(1), and an
-  exact semantic match for "find the one device this config entry
-  registered under this identifier."
+- **Container and stack tags** (Dockhand 1.0.49+). Dockhand now has
+  user-defined tags with a name, colour and icon (`GET /api/tags`), assigned
+  per container (`GET /api/container-tags?env=` → `{name: [tagId]}`) and per
+  stack (`GET /api/stack-tags?env=`), plus a `dockhand.tags` container label
+  that stacks inherit. Exposing them would mean a `tags` attribute (names,
+  maybe colours) on the container and stack state/status sensors, fetched
+  per environment on the slow coordinator (needs `containers:view` /
+  `stacks:view`). The main consumer would be ha-dockhand-cards: tag pills
+  and filtering/grouping by tag, which fits the filters planned for cards
+  2.0.0. Raetha: worth doing, not urgent (2026-10-14).
 
 - **`UnitOfRatio.PERCENTAGE` for percentage sensors.** A newer HA enum
   than what this integration currently targets — requires HA minimum
   bumped past 2026.7. Current minimum is 2026.3; no other reason to bump
-  it has come up yet. Bundle into the 2.0.0 release (see above) once the
-  HA minimum moves for the `async_get_device_by_identifier` migration.
+  it has come up yet (the `async_get_device_by_identifier` migration that
+  was expected to force it landed in 1.11.0 behind feature detection
+  instead, keeping the minimum where it is).
 
 - **Runtime controls: Block I/O (`Blkio*`) fields.** Left out of the
   first pass — low value for home-lab use, and real complexity (per-device
@@ -297,6 +197,29 @@ the reasoning first and only revisit if the stated condition has changed.
   specifically.
 
 ## Rejected
+
+- **Removing precise updates (`DockhandUpdateCoordinator`, Tier 2 /
+  `CONF_ENABLE_PRECISE_UPDATES`).** Kept on purpose (Raetha, 2026-10-15): it's
+  the only way to see that a system container (Dockhand itself, a Hawser
+  agent) has an update. Dockhand never persists a `pending_container_updates`
+  row for a system container — both `env-update-check.ts`
+  (`if (isSystemContainer(imageName)) continue`) and the check-updates route
+  skip writing it — so the always-on Tier 1 `pending-updates` poll can never
+  report one; only Tier 2's in-memory copy of the raw check-updates response
+  does (confirmed live: with precise updates off, those entities always read
+  as up to date). For ordinary containers Tier 2 adds no new signal since
+  1.10.0 — Tier 1 carries the same registry result from Dockhand's own
+  scheduled check. Revisit only if Dockhand starts exposing system-container
+  update status through a stored, pollable endpoint.
+
+- **Running a command inside a container from HA** (Dockhand 1.0.49+'s
+  `POST /api/containers/{id}/exec/run`, which runs a short command and
+  returns stdout, stderr and the exit code). Too powerful to trigger from
+  HA directly for now — anything that can call an HA action could run
+  arbitrary commands in any container. Only worth revisiting as part of a
+  deliberate, opt-in "advanced features" set (off by default, clearly
+  warned, ideally admin-only), never as an ordinary entity or action
+  (Raetha, 2026-10-14).
 
 - **Activity stats `byAction` breakdown as a separate sensor.** Tried and
   reverted during 1.8.0 development as a pure duplicate — the existing

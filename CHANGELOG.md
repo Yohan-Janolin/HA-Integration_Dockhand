@@ -2,10 +2,150 @@
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-10-19
+
+### Added
+
+- **New `newer_version` attribute on container update entities** (#39) — the
+  newer version tag Dockhand found for the container, whenever there is one.
+  The entity's own latest version still shows an update that can be installed
+  first, so until now a newer version tag available at the same time was only
+  mentioned in the release notes dialog. Alongside it, `newer_version_bump`
+  (`major`, `minor` or `patch`) and `newer_versions_count` (how many newer
+  versions there are, including that one). ha-dockhand-cards 1.5.0's Updates,
+  Containers and Stack cards use these to show both.
+- **Stack CPU, memory, network and disk I/O sensors** (Dockhand 1.0.52+) —
+  each stack's totals exactly as Dockhand reports them, the same numbers its
+  own Stacks page shows: CPU, memory usage, memory limit, network in/out and
+  disk read/write, with how many running containers they cover. Created by
+  the **Enable container and stack stats** option (see Changed), and only
+  when Dockhand is new enough to provide them; ha-dockhand-cards 1.5.0's
+  Stack card shows them.
+- **Digest-pinned images whose tag has moved on, and updates held by the
+  minimum image age**, both shown as updates you can't install from Home
+  Assistant, the way a newer version tag already is. The update entity
+  turns on with Install unavailable, so both appear in Home Assistant's own
+  list of updates:
+  - An image pinned to a digest (`image:tag@sha256:…`) whose tag has moved
+    to a new image (Dockhand 1.0.54+): the update is changing the pin. It
+    has a `pinned_digest_moved` attribute, and the release notes say what
+    to do.
+  - An update Dockhand is holding until the new image reaches its minimum
+    image age (Dockhand 1.0.52+): an `update_held_hours` attribute counts
+    down from Dockhand's check, reaching 0 when the wait is over; Dockhand's
+    next update check then offers it as a normal update.
+
+  Both turn off again as soon as Dockhand stops reporting them. The
+  environment's Containers sensor counts them in `pending_updates_total`,
+  and separately as `pending_pinned_digest_updates` and
+  `pending_held_updates`. ha-dockhand-cards 1.5.0 shows them on the
+  Updates, Containers and Stack cards.
+- **Leftover devices can be deleted by hand.** Devices are still removed
+  automatically once Dockhand confirms a container, stack or environment is
+  gone, and kept while it can't (the environment is offline, or a fetch
+  failed). A device that's left behind that way — an environment deleted
+  while it was offline, say — can now be deleted from its device page.
+  Deleting is refused for anything Dockhand still reports, since it would
+  only come back on the next poll.
+
+### Changed
+
+- **"Enable container stats" is now "Enable container and stack stats"**,
+  since it now also creates the stack sensors above, and **"Update check
+  interval" is now "Precise update check interval"**, since it only ever
+  applied to precise update versions.
+- **Settings are stored under clearer names and in one place.** Three
+  settings have new internal names (`enable_resource_stats`,
+  `poll_interval_fast` and `poll_interval_precise_updates`), and installs
+  first set up before 1.7.1 have their settings moved from where the
+  connection details are kept to where the Configure dialog keeps them.
+  Your existing choices carry over automatically when you upgrade, and
+  nothing changes in the Configure dialog beyond the two labels above.
+- **Downgrading keeps working, settings included.** Going back to 1.8.0 or
+  any later release loads your existing configuration with every setting as
+  you left it (the renamed ones are also saved under their old names for
+  exactly this), and anything you change while downgraded carries over when
+  you upgrade again. Only features newer than the release you go back to
+  are, naturally, missing there. From now on, a downgrade is supported back
+  to the releases before the most recent change to how settings are stored;
+  going further back is refused with a message in the log, instead of
+  quietly putting renamed settings back to their defaults.
+
+### Fixed
+
+- **Install isn't offered for a digest-pinned image whose tag has moved
+  on** (Dockhand 1.0.54+). Dockhand 1.0.54 reports these as updates in
+  its precise check, but pulling a pinned reference
+  (`image:tag@sha256:…`) returns the same image, so Install couldn't do
+  anything, and **Update all** would have included them. They're now shown
+  as advisory instead (see Added).
+- **Install isn't offered for Dockhand or Hawser when Docker lists its image
+  by ID.** Dockhand decides whether a container is one of its own system
+  containers from the image name. When Docker shows the container's image
+  as a bare ID (`sha256:…`) instead, Dockhand's containers list doesn't
+  recognize it, so Install, the update entity's warning, and **Update all**
+  treated it as an ordinary container. Dockhand still skipped the actual
+  update. The integration now also uses the answer from Dockhand's update
+  check, which reads the image the container was configured with.
+- **Install no longer reports success when Dockhand skipped the container.**
+  Since Dockhand 1.0.53, an update can be skipped inside a job that still
+  finishes normally — for example the container Dockhand reaches the
+  environment through, or one already updated outside Dockhand. Install now
+  shows Dockhand's reason as an error instead of appearing to have worked.
+- **No more device registry deprecation warning in the log on Home Assistant
+  2026.8 and later.** Device lookups use HA's newer per-config-entry lookup
+  when it's available, and the older one on earlier releases, so the
+  minimum Home Assistant version stays 2026.3.
+
 ### Internal
 
+- Ready for Home Assistant 2026.11, which changes an entity's ID in place when
+  you rename it instead of removing and re-adding it — but only for entity
+  classes that declare they can. The one entity class that needed to (the
+  memory limit control) now does, and a test fails if a future entity
+  class would fall back to removing and re-adding. The fallback ends in
+  2027.11.
+- A standard for the stored configuration's schema version, now in
+  `docs/ARCHITECTURE.md` §4 and `docs/SEMVER.md`: downgrades are supported
+  to the previous schema version only, so stored entries only keep the old
+  setting names of the latest schema change and drop them at the next one;
+  ordinary releases only bump the minor version, and the major version only
+  changes in a major release, which retires old rename code. The rules are
+  built into the code (`RENAMED_OPTIONS` in `const.py`), so nothing has to
+  be retired by hand at the right release. Entity and device registry
+  migrations now follow the same rule (`REGISTRY_MIGRATIONS` in
+  `migration.py`) instead of each carrying its own "retire after" version.
+- `scripts/bump_version.sh` takes an optional release date, makes all its
+  checks before changing anything, and writes both files before printing,
+  so it can no longer stop halfway (for example when its output is piped
+  into `head`). It no longer needs `jq`.
+- Tests now run against Home Assistant 2026.10.2
+  (pytest-homeassistant-custom-component 0.13.373).
+- `docs/DOCKHAND_API.md` regenerated from Dockhand 1.0.54, and the
+  compatibility table in `CONTRIBUTING.md` updated after reviewing Dockhand
+  1.0.49–1.0.54 and Home Assistant 2026.8–2026.10.
 - The README's logo is now centered, matching the ha-dockhand-cards README, and its pointer to
-  ha-dockhand-cards lists all nine cards instead of the original five.
+  ha-dockhand-cards lists all nine cards instead of the original five. It
+  also gained Use cases, more example automations and a Known limitations
+  section, and its existing example now uses a real entity ID.
+- Quality scale re-audit (`docs/QUALITY_SCALE.md`, which now records how
+  and when it's reviewed). Home Assistant's two new Bronze rules
+  (docs-triggers, docs-conditions) don't apply. Strict typing was marked
+  done but mypy had never been run: `mypy.ini` now carries Home Assistant
+  core's own strict settings, and the code passes them (explicit
+  `@override`, typed API responses, and a typed options flow entry). The
+  shared container and stack entity bases moved to `entity.py`. An API
+  response of the wrong shape is now a failed fetch instead of an error
+  further on, and a cancelled environment fetch is no longer mistaken for
+  data.
+- Tests now cover every line of the integration (from about 96%), which
+  turned up a little dead code, now removed: a reauth branch in the token
+  step that no flow could reach, error handling the precise update
+  coordinator could never hit, and two checks that could never fail.
+- CI and `scripts/run_tests.sh --full` now also run mypy, fail on any line
+  the tests don't run, and compare `quality_scale.yaml` with Home Assistant's
+  current rule list (`scripts/check_quality_scale.py`), so new rules and
+  regressions show up without waiting for a manual review.
 
 ## [1.10.2] — 2026-09-24
 
@@ -1160,7 +1300,8 @@ No-auth installations are unaffected.
 
 Initial stable release.
 
-[Unreleased]: https://github.com/raetha/ha-dockhand/compare/v1.10.2...HEAD
+[Unreleased]: https://github.com/raetha/ha-dockhand/compare/v1.11.0...HEAD
+[1.11.0]: https://github.com/raetha/ha-dockhand/compare/v1.10.2...v1.11.0
 [1.10.2]: https://github.com/raetha/ha-dockhand/compare/v1.10.1...v1.10.2
 [1.10.1]: https://github.com/raetha/ha-dockhand/compare/v1.10.0...v1.10.1
 [1.10.0]: https://github.com/raetha/ha-dockhand/compare/v1.9.4...v1.10.0

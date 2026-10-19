@@ -22,12 +22,14 @@ from unittest.mock import MagicMock
 
 from custom_components.dockhand.helpers import (
     _actionable_pending_update_container_ids,
+    _device_by_identifier,
     _all_envs,
     _compose_project,
     _container_device,
     _container_has_healthcheck,
     _container_has_pending_update,
     _container_is_bulk_update_eligible,
+    _is_system_container,
     _container_url,
     _coordinator_env,
     _ensure_env_devices,
@@ -184,15 +186,15 @@ def mock_dr(monkeypatch):
 
     mock_reg = MagicMock()
 
-    def _async_get_device(*, identifiers=None, connections=None):
-        key = next(iter(identifiers))[1]
-        if key in registry_map:
+    def _async_get_device_by_identifier(identifier, config_entry_id):
+        key = identifier[1]
+        if config_entry_id == ENTRY_ID and key in registry_map:
             dev = MagicMock()
             dev.id = registry_map[key]
             return dev
         return None
 
-    mock_reg.async_get_device = _async_get_device
+    mock_reg.async_get_device_by_identifier = _async_get_device_by_identifier
 
     mock_dr_module = MagicMock()
     mock_dr_module.async_get.return_value = mock_reg
@@ -201,6 +203,27 @@ def mock_dr(monkeypatch):
 
     mock_hass = MagicMock()
     return registry_map, mock_hass
+
+
+# ---------------------------------------------------------------------------
+# _device_by_identifier
+# ---------------------------------------------------------------------------
+
+
+def test_device_by_identifier_uses_scoped_lookup_when_available():
+    """HA 2026.8+: the entry-scoped lookup, never the deprecated one."""
+    reg = MagicMock()
+    _device_by_identifier(reg, ("dockhand", "x"), ENTRY_ID)
+    reg.async_get_device_by_identifier.assert_called_once_with(
+        ("dockhand", "x"), ENTRY_ID
+    )
+    reg.async_get_device.assert_not_called()
+
+
+def test_device_by_identifier_falls_back_before_ha_2026_8():
+    reg = MagicMock(spec=["async_get_device"])
+    _device_by_identifier(reg, ("dockhand", "x"), ENTRY_ID)
+    reg.async_get_device.assert_called_once_with(identifiers={("dockhand", "x")})
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1240,26 @@ def test_actionable_pending_update_container_ids_folds_in_tier_2():
     ) == ["id-web"]
 
 
+def test_a_check_catches_a_system_container_the_list_misses():
+    """Dockhand's containers list classifies the image as Docker lists it,
+    which can be a bare id; check-updates classifies the configured image.
+    Either tier's check result is enough."""
+    container = {"id": "id-dockhand", "image": "sha256:53fd", "systemContainer": None}
+    tier2 = {"id-dockhand": {"hasUpdate": True, "systemContainer": "dockhand"}}
+    tier1 = {"id-dockhand": {"hasImageUpdate": True, "systemContainer": "dockhand"}}
+    assert _is_system_container(container) is False
+    assert _is_system_container(container, update_env_data=tier2) is True
+    assert _is_system_container(container, pending_details=tier1) is True
+    assert _container_is_bulk_update_eligible(container, tier1) is False
+    assert _actionable_pending_update_container_ids([container], set(), tier2) == []
+    assert (
+        _actionable_pending_update_container_ids(
+            [container], {"id-dockhand"}, None, tier1
+        )
+        == []
+    )
+
+
 def test_actionable_pending_update_container_ids_skips_containers_without_id():
     containers = [{"systemContainer": None}]
     assert _actionable_pending_update_container_ids(containers, {"id-web"}, None) == []
@@ -1277,3 +1320,11 @@ def test_all_envs_environments_key_explicitly_null():
 def test_all_envs_returns_real_data_when_present():
     data = {"environments": {1: {"host": {}}, 2: {"host": {}}}}
     assert _all_envs(data) == {1: {"host": {}}, 2: {"host": {}}}
+
+
+def test_already_registered_without_a_unique_id_is_never_registered(hass):
+    from custom_components.dockhand.helpers import already_registered
+
+    known: set[str] = set()
+    assert already_registered(hass, known, "sensor", None) is False
+    assert known == set()

@@ -1,88 +1,94 @@
 #!/usr/bin/env bash
-# bump_version.sh — update manifest.json, promote the Unreleased CHANGELOG
-# section to a dated release heading, maintain compare links, commit hints.
-# Usage: ./scripts/bump_version.sh 1.7.4
-set -e
+# bump_version.sh — set manifest.json's version, promote the Unreleased
+# CHANGELOG section to a dated release heading, and update the compare links.
+#
+# Usage: ./scripts/bump_version.sh <X.Y.Z> [YYYY-MM-DD]
+#   The date defaults to today; pass one when preparing a release ahead of
+#   the day it ships.
+#
+# Every check runs before anything is written, and both files are written
+# before anything is printed, so the bump is all-or-nothing: piping the
+# output into `head` (or the terminal going away) can't stop it halfway with
+# manifest.json bumped but CHANGELOG.md not.
+set -euo pipefail
 
-if [ -z "$1" ]; then
-  echo "Usage: ./scripts/bump_version.sh <new_version>"
-  echo "Example: ./scripts/bump_version.sh 1.7.4"
+cd "$(dirname "$0")/.."
+
+usage() {
+  echo "Usage: ./scripts/bump_version.sh <X.Y.Z> [YYYY-MM-DD]" >&2
   exit 1
-fi
+}
 
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
 VERSION="$1"
-DATE=$(date +%Y-%m-%d)
+DATE="${2:-$(date +%Y-%m-%d)}"
 MANIFEST="custom_components/dockhand/manifest.json"
 CHANGELOG="CHANGELOG.md"
 REPO_URL="https://github.com/raetha/ha-dockhand"
 
-# Validate semver-ish format
-if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-  echo "Error: version must be in X.Y.Z format"
+fail() {
+  echo "Error: $*" >&2
   exit 1
-fi
+}
 
-if ! command -v jq >/dev/null; then
-  echo "Error: jq is required (used to update manifest.json)"
-  exit 1
-fi
-
-# A dirty tree is fine — the version bump is commonly committed together
-# with the associated changes. Warn (don't block) if the two files this
-# script rewrites already have uncommitted edits, since undoing a bump then
-# requires manual cleanup instead of a simple git checkout.
-if ! git diff --quiet -- "$MANIFEST" "$CHANGELOG" \
-   || ! git diff --cached --quiet -- "$MANIFEST" "$CHANGELOG"; then
-  echo "Warning: $MANIFEST and/or $CHANGELOG have uncommitted changes."
-  echo "         This script rewrites both; undoing the bump will require"
-  echo "         manual edits rather than 'git checkout'."
-fi
-
-# The Unreleased section and its compare link must exist — the release
-# heading is inserted beneath it and the previous tag is read from its link.
-if ! grep -q '^## \[Unreleased\]' "$CHANGELOG"; then
-  echo "Error: no '## [Unreleased]' section found in $CHANGELOG"
-  exit 1
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be X.Y.Z, got '$VERSION'"
+[[ "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "date must be YYYY-MM-DD, got '$DATE'"
+grep -qE '^  "version": "[^"]*",?$' "$MANIFEST" || fail "no \"version\" line found in $MANIFEST"
+grep -q '^## \[Unreleased\]' "$CHANGELOG" || fail "no '## [Unreleased]' section in $CHANGELOG"
+if grep -qF "## [$VERSION]" "$CHANGELOG"; then
+  fail "$CHANGELOG already has a [$VERSION] section — already bumped?"
 fi
 PREV_TAG=$(grep -oE '^\[Unreleased\]: .*/compare/v[0-9]+\.[0-9]+\.[0-9]+\.\.\.HEAD' "$CHANGELOG" \
-  | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-if [ -z "$PREV_TAG" ]; then
-  echo "Error: could not determine previous tag from the [Unreleased] compare link"
-  exit 1
+  | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+[ -n "$PREV_TAG" ] || fail "could not read the previous tag from the [Unreleased] compare link"
+
+DIRTY=""
+if ! git diff --quiet -- "$MANIFEST" "$CHANGELOG" 2>/dev/null \
+   || ! git diff --cached --quiet -- "$MANIFEST" "$CHANGELOG" 2>/dev/null; then
+  DIRTY=1
 fi
 
-echo "Bumping version to $VERSION (previous release: $PREV_TAG)..."
+TMP_MANIFEST=$(mktemp)
+TMP_CHANGELOG=$(mktemp)
+trap 'rm -f "$TMP_MANIFEST" "$TMP_CHANGELOG"' EXIT
 
-# Update manifest.json
-jq ".version = \"$VERSION\"" "$MANIFEST" > manifest.tmp && mv manifest.tmp "$MANIFEST"
-echo "  Updated $MANIFEST"
+# A plain line edit rather than a JSON rewrite, so the file's own key order
+# (domain, name, then alphabetical) and formatting stay exactly as they are.
+sed -E "s/^(  \"version\": )\"[^\"]*\"/\1\"$VERSION\"/" "$MANIFEST" > "$TMP_MANIFEST"
 
-# Insert the dated release heading directly beneath [Unreleased], so any
-# notes drafted under Unreleased become the notes for this release.
-awk -v ver="$VERSION" -v date="$DATE" '
-  /^## \[Unreleased\]/ && !done {
-    print; print ""; print "## [" ver "] — " date; done=1; next
+# Insert the dated heading directly beneath [Unreleased], so the notes
+# drafted there become this release's, and point the compare links at it.
+awk -v ver="$VERSION" -v date="$DATE" -v prev="$PREV_TAG" -v repo="$REPO_URL" '
+  /^## \[Unreleased\]/ && !heading {
+    print; print ""; print "## [" ver "] — " date; heading = 1; next
   }
-  { print }
-' "$CHANGELOG" > changelog.tmp && mv changelog.tmp "$CHANGELOG"
-
-# Update compare links: point Unreleased at the new tag and add this
-# release directly beneath it.
-awk -v ver="$VERSION" -v prev="$PREV_TAG" -v repo="$REPO_URL" '
-  /^\[Unreleased\]: / {
+  /^\[Unreleased\]: / && !links {
     print "[Unreleased]: " repo "/compare/v" ver "...HEAD"
     print "[" ver "]: " repo "/compare/" prev "...v" ver
-    next
+    links = 1; next
   }
   { print }
-' "$CHANGELOG" > changelog.tmp && mv changelog.tmp "$CHANGELOG"
-echo "  Updated $CHANGELOG (release heading + compare links)"
-echo ""
-echo "  Review CHANGELOG.md, then commit (together with any other staged"
-echo "  changes for this release) and tag:"
-echo "    git add -A"
-echo "    git commit -m \"Release $VERSION\""
-echo "    git tag -a v$VERSION -m \"Release $VERSION\""
-echo "    git push && git push --tags"
-echo ""
-echo "  The GitHub Actions release workflow will trigger automatically on the tag push."
+' "$CHANGELOG" > "$TMP_CHANGELOG"
+
+grep -qF "\"version\": \"$VERSION\"" "$TMP_MANIFEST" || fail "manifest.json version edit didn't apply"
+grep -qF "## [$VERSION] — $DATE" "$TMP_CHANGELOG" || fail "CHANGELOG heading edit didn't apply"
+
+cat "$TMP_MANIFEST" > "$MANIFEST"
+cat "$TMP_CHANGELOG" > "$CHANGELOG"
+
+{
+  echo "Bumped to $VERSION ($DATE), previous release $PREV_TAG."
+  echo "  Updated $MANIFEST and $CHANGELOG (release heading + compare links)."
+  if [ -n "$DIRTY" ]; then
+    echo "  Note: both files had uncommitted changes, so undoing this needs"
+    echo "  manual edits rather than 'git checkout'."
+  fi
+  echo ""
+  echo "  Review CHANGELOG.md, then commit and tag:"
+  echo "    git add -A"
+  echo "    git commit -m \"Release $VERSION\""
+  echo "    git tag -a v$VERSION -m \"Release $VERSION\""
+  echo "    git push && git push --tags"
+  echo ""
+  echo "  The GitHub Actions release workflow runs on the tag push."
+} || true

@@ -200,3 +200,13 @@ def test_unique_id_format():
         entity._attr_unique_id
         == f"{ENTRY_ID}_{ENV_ID}_container_{CONTAINER_NAME}_restart_policy"
     )
+
+
+def test_unavailable_once_the_container_is_gone():
+    fast = _make_fast_coord()
+    fast.data["environments"][ENV_ID]["containers"] = []
+    entity = DockhandContainerRestartPolicySelect(
+        fast, _make_slow_coord({}), ENTRY_ID, ENV_ID, CONTAINER_NAME
+    )
+    entity.hass = MagicMock()
+    assert entity.available is False

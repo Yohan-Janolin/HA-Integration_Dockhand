@@ -6,18 +6,20 @@ dependencies.  Platform modules (sensor.py etc.) are loaded lazily by HA and
 must never be imported by __init__.py or by each other.
 """
 
+import math
+from datetime import datetime
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.device_registry import DeviceEntryType
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 
 
-def _device_entry_id(hass: Any, identifier: str) -> str | None:
+def _device_entry_id(hass: Any, entry_id: str, identifier: str) -> str | None:
     """Look up a device's unique registry id (UUID) by its (DOMAIN, identifier) key.
 
     Returns None when the device hasn't been registered yet, or when hass is
@@ -31,15 +33,32 @@ def _device_entry_id(hass: Any, identifier: str) -> str | None:
     """
     if hass is None:
         return None
-    device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, identifier)})
+    device = _device_by_identifier(dr.async_get(hass), (DOMAIN, identifier), entry_id)
     return device.id if device else None
+
+
+def _device_by_identifier(
+    registry: dr.DeviceRegistry, identifier: tuple[str, str], config_entry_id: str
+) -> dr.DeviceEntry | None:
+    """The device with this identifier in this config entry.
+
+    HA 2026.8 replaced async_get_device(identifiers=...) with the
+    entry-scoped async_get_device_by_identifier and logs a deprecation
+    warning for the old call (removed in 2027.8). Feature-detected so the
+    HA minimum can stay below 2026.8.
+    """
+    by_identifier = getattr(registry, "async_get_device_by_identifier", None)
+    if by_identifier is not None:
+        device: dr.DeviceEntry | None = by_identifier(identifier, config_entry_id)
+        return device
+    return registry.async_get_device(identifiers={identifier})
 
 
 def already_registered(
     hass: HomeAssistant,
     known_ids: set[str],
     entity_domain: str,
-    unique_id: str,
+    unique_id: str | None,
     pending_readd_ids: set[str] | None = None,
 ) -> bool:
     """Whether an entity with this unique_id has already been added to HA
@@ -117,6 +136,8 @@ def already_registered(
     window between "re-add scheduled" and "re-add landed." All platform
     call sites in this integration pass the real set.
     """
+    if unique_id is None:  # Entity.unique_id's type; every Dockhand entity sets one
+        return False
     key = f"{entity_domain}:{unique_id}"
     if key in known_ids:
         ent_registry = er.async_get(hass)
@@ -168,6 +189,12 @@ CONTAINER_STATS_SUFFIXES = (
     "_network_tx",
     "_block_read",
     "_block_write",
+)
+
+# The stack totals Dockhand reports (GET /api/stack-stats) — the container
+# set minus memory percent, which Dockhand doesn't give for a stack.
+STACK_STATS_SUFFIXES = tuple(
+    suffix for suffix in CONTAINER_STATS_SUFFIXES if suffix != "_memory_percent"
 )
 
 # "_memory_limit" here is a deliberate exact collision with a runtime
@@ -236,8 +263,18 @@ def _find_container(
     question entirely, rather than relying on it.
     """
     for c in _coordinator_env(coordinator_data, env_id).get("containers") or []:
-        if c.get("name") == container_name:
+        if isinstance(c, dict) and c.get("name") == container_name:
             return c
+    return None
+
+
+def _find_git_stack(
+    coordinator_data: dict[str, Any] | None, env_id: int, stack_name: str
+) -> dict[str, Any] | None:
+    """A git stack's current dict (slow coordinator) by its stack name."""
+    for gs in _coordinator_env(coordinator_data, env_id).get("git_stacks") or []:
+        if isinstance(gs, dict) and gs.get("stackName") == stack_name:
+            return gs
     return None
 
 
@@ -250,7 +287,7 @@ def _find_stack(
     switch.py), otherwise identical.
     """
     for s in _coordinator_env(coordinator_data, env_id).get("stacks") or []:
-        if s.get("name") == stack_name:
+        if isinstance(s, dict) and s.get("name") == stack_name:
             return s
     return None
 
@@ -398,7 +435,7 @@ def _device_id_schedule(entry_id: str, sched_id: Any, sched_type: str) -> str:
 def _env_device(
     entry_id: str, env_id: int, env_name: str, base_url: str, stats: dict | None = None
 ) -> DeviceInfo:
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_env(entry_id, env_id))},
         "name": env_name,
         "manufacturer": "Dockhand",
@@ -410,13 +447,13 @@ def _env_device(
         conn = stats.get("connectionType")
         if conn:
             info["hw_version"] = conn
-    return DeviceInfo(**info)
+    return info
 
 
 def _containers_group_device(
     hass: Any, entry_id: str, env_id: int, env_name: str, base_url: str
 ) -> DeviceInfo:
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_containers_group(entry_id, env_id))},
         "name": f"{env_name} – Containers",
         "manufacturer": "Dockhand",
@@ -424,16 +461,16 @@ def _containers_group_device(
         "configuration_url": _container_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, _device_id_env(entry_id, env_id))
+    parent_id = _device_entry_id(hass, entry_id, _device_id_env(entry_id, env_id))
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 def _stacks_group_device(
     hass: Any, entry_id: str, env_id: int, env_name: str, base_url: str
 ) -> DeviceInfo:
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_stacks_group(entry_id, env_id))},
         "name": f"{env_name} – Stacks",
         "manufacturer": "Dockhand",
@@ -441,16 +478,16 @@ def _stacks_group_device(
         "configuration_url": _stack_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, _device_id_env(entry_id, env_id))
+    parent_id = _device_entry_id(hass, entry_id, _device_id_env(entry_id, env_id))
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 def _network_group_device(
     hass: Any, entry_id: str, env_id: int, env_name: str, base_url: str
 ) -> DeviceInfo:
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_networks_group(entry_id, env_id))},
         "name": f"{env_name} – Networks",
         "manufacturer": "Dockhand",
@@ -458,16 +495,16 @@ def _network_group_device(
         "configuration_url": _network_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, _device_id_env(entry_id, env_id))
+    parent_id = _device_entry_id(hass, entry_id, _device_id_env(entry_id, env_id))
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 def _volume_group_device(
     hass: Any, entry_id: str, env_id: int, env_name: str, base_url: str
 ) -> DeviceInfo:
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_volumes_group(entry_id, env_id))},
         "name": f"{env_name} – Volumes",
         "manufacturer": "Dockhand",
@@ -475,10 +512,10 @@ def _volume_group_device(
         "configuration_url": _volume_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, _device_id_env(entry_id, env_id))
+    parent_id = _device_entry_id(hass, entry_id, _device_id_env(entry_id, env_id))
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 def _container_device(
@@ -507,7 +544,7 @@ def _container_device(
         parent_identifier = _device_id_stack(entry_id, env_id, stack_name)
     else:
         parent_identifier = _device_id_containers_group(entry_id, env_id)
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {
             (DOMAIN, _device_id_container(entry_id, env_id, container_name))
         },
@@ -517,10 +554,10 @@ def _container_device(
         "configuration_url": _container_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, parent_identifier)
+    parent_id = _device_entry_id(hass, entry_id, parent_identifier)
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 _STACK_MODEL_BY_SOURCE_TYPE = {
@@ -560,7 +597,7 @@ def _stack_device(
     stacks that predate installing Dockhand were never explicitly
     recorded in its database.
     """
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_stack(entry_id, env_id, stack_name))},
         "name": f"{env_name} – Stacks – {stack_name}",
         "manufacturer": "Dockhand",
@@ -570,16 +607,18 @@ def _stack_device(
         "configuration_url": _stack_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, _device_id_stacks_group(entry_id, env_id))
+    parent_id = _device_entry_id(
+        hass, entry_id, _device_id_stacks_group(entry_id, env_id)
+    )
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 def _image_group_device(
     hass: Any, entry_id: str, env_id: int, env_name: str, base_url: str
 ) -> DeviceInfo:
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_images_group(entry_id, env_id))},
         "name": f"{env_name} – Images",
         "manufacturer": "Dockhand",
@@ -587,10 +626,10 @@ def _image_group_device(
         "configuration_url": _image_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, _device_id_env(entry_id, env_id))
+    parent_id = _device_entry_id(hass, entry_id, _device_id_env(entry_id, env_id))
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 def _sched_key(sched: dict) -> str:
@@ -608,7 +647,7 @@ def _schedule_group_device(
     group-of-entities, since individual schedule devices (via `_sched_device`)
     need to exist as their own devices regardless of this grouping.
     """
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_schedules_group(entry_id, env_id))},
         "name": f"{env_name} – Schedules",
         "manufacturer": "Dockhand",
@@ -616,10 +655,10 @@ def _schedule_group_device(
         "configuration_url": _schedules_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, _device_id_env(entry_id, env_id))
+    parent_id = _device_entry_id(hass, entry_id, _device_id_env(entry_id, env_id))
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 def _sched_device(
@@ -669,7 +708,7 @@ def _sched_device(
     else:
         parent_identifier = _device_id_schedules_hub(entry_id)
         prefix = "Dockhand"
-    info: dict[str, Any] = {
+    info: DeviceInfo = {
         "identifiers": {(DOMAIN, _device_id_schedule(entry_id, sched_id, sched_type))},
         "name": f"{prefix} – Schedules – {sched_name}",
         "manufacturer": "Dockhand",
@@ -677,10 +716,10 @@ def _sched_device(
         "configuration_url": _schedules_url(base_url),
         "entry_type": DeviceEntryType.SERVICE,
     }
-    parent_id = _device_entry_id(hass, parent_identifier)
+    parent_id = _device_entry_id(hass, entry_id, parent_identifier)
     if parent_id is not None:
         info["via_device_id"] = parent_id
-    return DeviceInfo(**info)
+    return info
 
 
 # --------------------------------------------------------------------------- #
@@ -697,7 +736,7 @@ def _image_display_name(image: dict) -> str:
     """
     tags = [t for t in (image.get("repoTags") or []) if t and t != "<none>:<none>"]
     if tags:
-        return tags[0]
+        return str(tags[0])
     raw_id = image.get("id") or ""
     return raw_id.split(":")[-1][:12] if raw_id else "unknown"
 
@@ -825,7 +864,140 @@ def _container_has_version_suggestion_only(
     return bool(tag) and tag != _container_installed_version(container, tier2_item)
 
 
-def _container_is_bulk_update_eligible(container: dict) -> bool:
+def _container_update_status(
+    container: dict,
+    pending_details: dict[str, dict],
+    update_env_data: dict[str, dict] | None,
+) -> dict[str, Any]:
+    """This container's update status from the precise check (Tier 2) when
+    it has a row for the container, else from Dockhand's own cached check
+    (Tier 1) — the same precedence the update entity applies. Normalized to
+    the check-updates shape: hasUpdate, newerVersion, pinnedToDigest,
+    releaseAgeRemainingHours."""
+    container_id = container.get("id")
+    if not container_id:
+        return {}
+    tier2_item = (update_env_data or {}).get(container_id) or {}
+    tier1_detail = pending_details.get(container_id) or {}
+    if tier2_item:
+        status = dict(tier2_item)
+        if not status.get("newerVersion") and tier1_detail.get("newerVersion"):
+            status["newerVersion"] = tier1_detail["newerVersion"]
+        return status
+    if tier1_detail:
+        return {
+            "hasUpdate": bool(tier1_detail.get("hasImageUpdate")),
+            "newerVersion": tier1_detail.get("newerVersion"),
+            "pinnedToDigest": bool(tier1_detail.get("pinnedToDigest")),
+            "releaseAgeRemainingHours": tier1_detail.get("releaseAgeRemainingHours"),
+            "checkedAt": tier1_detail.get("checkedAt"),
+            **(
+                {"systemContainer": tier1_detail["systemContainer"]}
+                if tier1_detail.get("systemContainer")
+                else {}
+            ),
+        }
+    return {}
+
+
+def _is_system_container(
+    container: dict,
+    pending_details: dict[str, dict] | None = None,
+    update_env_data: dict[str, dict] | None = None,
+) -> bool:
+    """True for a Dockhand system container (Dockhand itself or a Hawser
+    agent), which Dockhand never updates and nothing here should offer to.
+
+    Dockhand classifies by image name, in two places that can disagree. Its
+    containers list (`systemContainer`) uses the image as Docker lists it,
+    which is the bare image id (`sha256:…`) whenever Docker can't put a name
+    to it, and then misses. check-updates uses the image the container was
+    configured with and gets it right. Either saying so is enough; the
+    check's answer is only known once a check has covered the container.
+    """
+    if container.get("systemContainer"):
+        return True
+    status = _container_update_status(container, pending_details or {}, update_env_data)
+    return bool(status.get("systemContainer"))
+
+
+def _update_held_hours(
+    status: dict[str, Any], now: datetime | None = None
+) -> int | None:
+    """Hours until an update Dockhand is holding back (minimum image age)
+    can be applied, from a _container_update_status() result; None when
+    nothing is held.
+
+    Dockhand works the hours out when it checks and stores them as they
+    were then, so they're counted down here from that check. 0 means the
+    wait is over and Dockhand will offer the update from its next check.
+    """
+    if status.get("hasUpdate"):
+        return None
+    hours = status.get("releaseAgeRemainingHours")
+    if not isinstance(hours, int) or isinstance(hours, bool) or hours <= 0:
+        return None
+    checked_at = status.get("checkedAt")
+    try:
+        checked = (
+            dt_util.parse_datetime(checked_at) if isinstance(checked_at, str) else None
+        )
+    except ValueError:
+        checked = None
+    if checked is None:
+        return hours
+    elapsed = ((now or dt_util.utcnow()) - checked).total_seconds() / 3600
+    return max(0, math.ceil(hours - elapsed))
+
+
+def _container_has_held_update_only(
+    container: dict,
+    pending_ids: set[str],
+    pending_details: dict[str, dict],
+    update_env_data: dict[str, dict] | None,
+) -> bool:
+    """True if this container's only update signal is one Dockhand is
+    holding until the new image reaches its minimum image age (its update
+    entity is on, Install withheld until Dockhand releases it). A newer
+    version tag or a moved pin, when there's one too, is what it's counted
+    as instead."""
+    if _container_has_pending_update(
+        container, pending_ids, update_env_data
+    ) or _container_has_version_suggestion_only(
+        container, pending_ids, pending_details, update_env_data
+    ):
+        return False
+    status = _container_update_status(container, pending_details, update_env_data)
+    if status.get("pinnedToDigest"):
+        return False
+    return _update_held_hours(status) is not None
+
+
+def _container_has_pinned_digest_only(
+    container: dict,
+    pending_ids: set[str],
+    pending_details: dict[str, dict],
+    update_env_data: dict[str, dict] | None,
+) -> bool:
+    """True if this container's only update signal is a moved digest behind
+    its digest-pinned image (advisory, like a newer version tag: its update
+    entity is on, but Install is withheld). A container that also has a
+    newer version tag is counted with those instead."""
+    if _container_has_pending_update(
+        container, pending_ids, update_env_data
+    ) or _container_has_version_suggestion_only(
+        container, pending_ids, pending_details, update_env_data
+    ):
+        return False
+    status = _container_update_status(container, pending_details, update_env_data)
+    return bool(status.get("pinnedToDigest"))
+
+
+def _container_is_bulk_update_eligible(
+    container: dict,
+    pending_details: dict[str, dict] | None = None,
+    update_env_data: dict[str, dict] | None = None,
+) -> bool:
     """True unless this is a Dockhand system container (dockhand itself,
     or a Hawser agent) — same `!container.systemContainer` check
     Dockhand's own frontend applies before offering its "Update all"
@@ -845,14 +1017,18 @@ def _container_is_bulk_update_eligible(container: dict) -> bool:
     update" is something a caller opts into by calling this function,
     not something they have to independently remember and re-derive
     correctly every time a new caller needs the same guarantee.
+
+    Uses _is_system_container(), so a system container the containers list
+    misses is still caught once a check has classified it.
     """
-    return not container.get("systemContainer")
+    return not _is_system_container(container, pending_details, update_env_data)
 
 
 def _actionable_pending_update_container_ids(
     containers: list[dict],
     pending_ids: set[str],
     update_env_data: dict[str, dict] | None,
+    pending_details: dict[str, dict] | None = None,
 ) -> list[str]:
     """Container ids in this environment eligible for an actual bulk
     update action right now: has a pending update per
@@ -873,7 +1049,7 @@ def _actionable_pending_update_container_ids(
         c["id"]
         for c in containers
         if c.get("id")
-        and _container_is_bulk_update_eligible(c)
+        and _container_is_bulk_update_eligible(c, pending_details, update_env_data)
         and _container_has_pending_update(c, pending_ids, update_env_data)
     ]
 
@@ -924,14 +1100,11 @@ def _short_digest(digest: str) -> str:
       currentDigest: "ghcr.io/finsys/hawser@sha256:53bb1e23fb302f..."
       newDigest:     "sha256:79f926e8d8fe31c0dfe90858f90b69bfd4cfbb..."
 
-    Returns the first 12 hex chars of the sha256, e.g. "53bb1e23fb30".
-    Falls back to the raw digest string if parsing fails.
+    Returns the first 12 hex chars of the sha256, e.g. "53bb1e23fb30", or
+    the digest as given when there's nothing after "sha256:".
     """
-    try:
-        sha_part = digest.split("sha256:")[-1]
-        return sha_part[:12] if sha_part else digest
-    except Exception:
-        return digest
+    sha_part = str(digest).split("sha256:")[-1]
+    return sha_part[:12] if sha_part else str(digest)
 
 
 def _container_installed_version(

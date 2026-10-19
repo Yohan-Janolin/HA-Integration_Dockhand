@@ -22,8 +22,8 @@ than the versions listed here.
 
 | Project | Last reviewed | Where to check |
 |---|---|---|
-| Home Assistant Core | 2026.3 (minimum); tested against 2026.7.2; 2026.7's full backward-incompatible changes list reviewed directly (2026-07-21) — nothing relevant to entity/coordinator/config_entries APIs this integration depends on | https://github.com/home-assistant/core/releases |
-| Dockhand | v1.0.48 (diffed v1.0.46→v1.0.48 source directly against every endpoint this integration calls — containers list/stats/inspect/start/stop/restart/check-updates/pending-updates/version-notes/update-runtime/batch-update-stream, environments, schedules, settings/semver, jobs/{id}, stacks start/stop/restart/deploy — for the full-project compatibility review ahead of the 1.10.0 release; nothing relevant found — the update/semver/version-notes route files and their supporting `src/lib/server` modules are byte-for-byte unchanged since v1.0.46) | https://github.com/Finsys/dockhand/releases |
+| Home Assistant Core | 2026.3 (minimum); tested against 2026.10.2 (PHCC 0.13.373); 2026.8–2026.10 developer blog and core platform/coordinator source reviewed directly (2026-10-14) — only change needed was the deprecated `async_get_device(identifiers=...)` lookup, now feature-detected (`helpers._device_by_identifier`). Also ready for 2026.11's in-place entity_id renames (`async_entity_id_changed`; guarded by `tests/test_entity_lifecycle.py`) | https://github.com/home-assistant/core/releases |
+| Dockhand | v1.0.54 (diffed v1.0.48→v1.0.54 source directly against every endpoint this integration calls, 2026-10-14 and 2026-10-19; `docs/DOCKHAND_API.md` regenerated at v1.0.54 — Dockhand now ships `@openapi` doc comments on most routes. Relevant: batch-update-stream can now skip a container inside a finished job (handled — Install reports it), the minimum-image-age cooldown keeps held updates out of `hasImageUpdate` (shown via `update_held_hours`), `/api/auto-update` now requires `schedules:view` (already needed for `/api/schedules`), new `env_report` schedule type; 1.0.54: `check-updates` reports a moved digest behind a digest-pinned image as `hasUpdate` plus `pinnedToDigest`; the client clears `hasUpdate` since Install can't apply it, and the update entity shows it as advisory. The dashboard stats' new `pinnedDigest`/`newerVersion` counts aren't used: the Containers sensor's own counts cover both and also see the precise check) | https://github.com/Finsys/dockhand/releases |
 
 Update this table after each review session. When picking up new Dockhand
 API work, also regenerate [docs/DOCKHAND_API.md](docs/DOCKHAND_API.md) —
@@ -151,13 +151,13 @@ repos share a release flow). Decide the bump before working through the release 
 A more thorough pass than the PR checklist above, run before tagging a
 release (not needed for every PR):
 
-- Full test suite + ruff check/format on both `custom_components/` and `tests/` — this now includes `test_config_flow.py`'s whole-tree translation coverage tests (see the "Translations" section below), so a missing/empty key or a locale that's drifted out of sync will already show up as a test failure here, not just at this checklist step
-- `manifest.json`: version bumped, field order correct (`domain`, `name`, then alphabetical)
+- `bash scripts/run_tests.sh --full`: ruff check/format on both `custom_components/` and `tests/`, mypy (strict), the quality scale rule check, and the full test suite with its 100% coverage gate — this now includes `test_config_flow.py`'s whole-tree translation coverage tests (see the "Translations" section below), so a missing/empty key or a locale that's drifted out of sync will already show up as a test failure here, not just at this checklist step
+- `manifest.json`: version bumped, field order correct (`domain`, `name`, then alphabetical). `scripts/bump_version.sh X.Y.Z [YYYY-MM-DD]` does the bump: it sets the manifest version, turns `[Unreleased]` into the dated release section and updates the compare links, in one all-or-nothing step (pass the date when preparing a release ahead of the day it ships)
 - `strings.json` and `translations/en.json` are byte-for-byte identical
 - Every locale in `translations/` has exactly the same keys as `en.json` (no missing, no extra) — except `api_url`, which stays English everywhere
 - Every entity `translation_key` used in code has both a `strings.json` and an `icons.json` entry, and vice versa (no orphans)
 - `CHANGELOG.md`: compare-link references at the bottom are correct; re-read the `[Unreleased]` section per the CHANGELOG discipline above
-- `quality_scale.yaml` comments still match current code (coordinator scope, redaction lists, disabled-by-default entity lists all tend to drift as features are added)
+- Quality scale review, per `docs/QUALITY_SCALE.md` "Release review": `run_tests.sh --full` already checks the rule list against Home Assistant's current one, strict typing and 100% line coverage; the review covers what those can't — rule requirements that changed, rules this release's additions touch, and `quality_scale.yaml` comments the release made stale. Add a line to that page's review log
 - `README.md` matches the current entity list and behavior
 - Config flow `CREATE_ENTRY` tests are preceded by whatever `setup_options`/options step they depend on
 - The packaging command above produces a clean zip (nothing unexpected included)
@@ -197,7 +197,7 @@ HA's frontend** — a key existing with a non-empty value doesn't
 guarantee HA resolves it to the right place on screen. This bit twice in
 the same 1.8.1 cycle: an attempt to visually group
 `enable_update_entities`/`enable_precise_updates`/`poll_interval_updates`
-via HA's `section()` helper kept showing those fields' labels as raw
+(now `poll_interval_precise_updates`) via HA's `section()` helper kept showing those fields' labels as raw
 config keys with no help text in a live instance, under two different
 translation-JSON structures, and the actual cause was never confirmed —
 these tests passed both times regardless, since the values existed and
@@ -250,4 +250,4 @@ The test suite uses [pytest-homeassistant-custom-component](https://github.com/M
 
 All test files import from `custom_components.dockhand`, which loads `homeassistant` at module level. As a result, **all tests require Python 3.14.2+ with PHCC installed** — there is no HA-free subset.
 
-All other test files require Python 3.14.2+ and PHCC. The CI workflow runs the full suite on every push. Coverage spans all API methods, all config flow steps and options flow, all three coordinators, all entity classes and platforms, all device registration helpers, all URL builders, update entity install/release_notes logic, and setup/unload lifecycle.
+The CI workflow runs the full suite on every push. **Every line of the integration is covered, and CI fails if a change adds one no test runs** (`--cov-fail-under=100`). Add the test with the code. If a line truly can't be reached, that usually means it can be removed; `# pragma: no cover` is for the rare line that must stay but genuinely can't run under test, with a comment saying why. `tests/test_platform_setup.py` runs the real setup with every option on and one environment containing a bit of everything, which is the place to add data when a new entity's creation path needs covering.

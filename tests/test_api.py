@@ -18,6 +18,7 @@ from custom_components.dockhand.api import (
     DockhandAuthError,
     DockhandClient,
     DockhandError,
+    DockhandNotFoundError,
 )
 
 
@@ -65,6 +66,17 @@ async def test_request_401_raises_auth_error():
 async def test_request_4xx_raises_dockhand_error():
     with pytest.raises(DockhandError, match="404"):
         await _client(_session(_resp(404, text="nf")))._request("GET", "/api/x")
+
+
+async def test_request_404_raises_not_found_error():
+    with pytest.raises(DockhandNotFoundError, match="404"):
+        await _client(_session(_resp(404, text="nf")))._request("GET", "/api/x")
+
+
+async def test_request_other_4xx_is_not_a_not_found_error():
+    with pytest.raises(DockhandError) as exc_info:
+        await _client(_session(_resp(403, text="denied")))._request("GET", "/api/x")
+    assert not isinstance(exc_info.value, DockhandNotFoundError)
 
 
 async def test_request_200_returns_json():
@@ -221,6 +233,21 @@ async def test_get_containers(client_with_mock_request):
 async def test_get_stacks(client_with_mock_request):
     await client_with_mock_request.async_get_stacks(2)
     assert client_with_mock_request._request.call_args.args[1] == "/api/stacks?env=2"
+
+
+async def test_get_stack_stats_url_and_list(client_with_mock_request):
+    client_with_mock_request._request.return_value = [{"name": "myapp"}]
+    assert await client_with_mock_request.async_get_stack_stats(2) == [
+        {"name": "myapp"}
+    ]
+    assert (
+        client_with_mock_request._request.call_args.args[1] == "/api/stack-stats?env=2"
+    )
+
+
+async def test_get_stack_stats_non_list_becomes_empty(client_with_mock_request):
+    client_with_mock_request._request.return_value = {"error": "x"}
+    assert await client_with_mock_request.async_get_stack_stats(2) == []
 
 
 async def test_check_container_updates_url(client_with_mock_request):
@@ -663,3 +690,107 @@ async def test_update_container_runtime_non_dict_returns_empty(action_client):
     action_client._request.return_value = None
     r = await action_client.async_update_container_runtime(1, "cid", {"Memory": 1})
     assert r == {}
+
+
+# ---------------------------------------------------------------------------
+# Response shapes and remaining endpoints
+# ---------------------------------------------------------------------------
+
+
+async def test_request_401_with_unreadable_body_still_raises_auth_error():
+    resp = _resp(401)
+    resp.text = AsyncMock(side_effect=Exception("connection closed"))
+    with pytest.raises(DockhandAuthError):
+        await _client(_session(resp))._request("GET", "/api/x")
+
+
+@pytest.mark.parametrize(
+    ("method", "args", "wrong_shape"),
+    [
+        ("async_get_containers", (1,), {"error": "x"}),
+        ("async_get_environments", (), "text"),
+        ("async_get_vulnerabilities_count", (1,), []),
+        ("async_get_recent_activity", (1,), []),
+    ],
+)
+async def test_wrong_response_shape_is_a_dockhand_error(
+    client_with_mock_request, method, args, wrong_shape
+):
+    """A reply of the wrong JSON type fails the fetch cleanly instead of
+    breaking whatever reads it later."""
+    client_with_mock_request._request.return_value = wrong_shape
+    with pytest.raises(DockhandError, match="Unexpected response"):
+        await getattr(client_with_mock_request, method)(*args)
+
+
+async def test_get_vulnerabilities_count(client_with_mock_request):
+    client_with_mock_request._request.return_value = {"summary": {"total": 2}}
+    result = await client_with_mock_request.async_get_vulnerabilities_count(3)
+    assert result == {"summary": {"total": 2}}
+    assert (
+        client_with_mock_request._request.call_args.args[1]
+        == "/api/vulnerabilities/count?env=3"
+    )
+
+
+async def test_get_recent_activity(client_with_mock_request):
+    client_with_mock_request._request.return_value = {"events": [], "total": 0}
+    await client_with_mock_request.async_get_recent_activity(3, limit=5)
+    assert (
+        client_with_mock_request._request.call_args.args[1]
+        == "/api/activity?environmentId=3&limit=5"
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "args", "path"),
+    [
+        ("async_get_all_dashboard_stats", (), "/api/dashboard/stats"),
+        ("async_get_container_stats", (2,), "/api/containers/stats?env=2"),
+    ],
+)
+async def test_list_endpoints_tolerate_a_non_list(
+    client_with_mock_request, method, args, path
+):
+    client_with_mock_request._request.return_value = {"unexpected": True}
+    assert await getattr(client_with_mock_request, method)(*args) == []
+    assert client_with_mock_request._request.call_args.args[1] == path
+    client_with_mock_request._request.return_value = [{"id": 1}]
+    assert await getattr(client_with_mock_request, method)(*args) == [{"id": 1}]
+
+
+async def test_deploy_stack(client_with_mock_request):
+    client_with_mock_request._request.return_value = {"success": True}
+    result = await client_with_mock_request.async_deploy_stack(2, "my stack")
+    assert result == {"success": True}
+    call = client_with_mock_request._request.call_args
+    assert call.args == ("POST", "/api/stacks/my%20stack/deploy?env=2")
+    assert call.kwargs["json"] == {"pull": True, "build": False, "forceRecreate": False}
+    client_with_mock_request._request.return_value = "not json"
+    assert await client_with_mock_request.async_deploy_stack(2, "s") == {}
+
+
+async def test_check_updates_a_moved_digest_on_a_pinned_image_is_not_an_update(
+    client_with_mock_request,
+):
+    """Dockhand 1.0.54+ flags it hasUpdate with pinnedToDigest; pulling the
+    pinned reference returns the same image, so Install couldn't apply it."""
+    client_with_mock_request._request.return_value = {
+        "results": [
+            {"containerId": "a", "hasUpdate": True, "pinnedToDigest": True},
+            {"containerId": "b", "hasUpdate": True},
+            "junk",
+        ]
+    }
+    results = await client_with_mock_request.async_check_container_updates(2)
+    assert results[0]["hasUpdate"] is False
+    assert results[0]["pinnedToDigest"] is True
+    assert results[1]["hasUpdate"] is True
+    assert results[2] == "junk"
+    # Stamped with when the check ran, for the held-update countdown.
+    assert results[0]["checkedAt"] == results[1]["checkedAt"]
+
+
+async def test_check_updates_tolerates_an_unexpected_reply(client_with_mock_request):
+    client_with_mock_request._request.return_value = {"results": "nope"}
+    assert await client_with_mock_request.async_check_container_updates(2) == []

@@ -18,9 +18,13 @@ Anything that can break an existing user's working setup without them changing t
 or that removes something they may depend on:
 
 - **ha-dockhand:**
-  - Config entry `VERSION` bump *without* a migration (a migration existing is what keeps a
-    schema change from being breaking to the end user — see `docs/ARCHITECTURE.md` §4).
-  - Renaming or removing a `CONF_*` key that isn't purely internal.
+  - A config entry schema **major** bump (`SCHEMA_VERSION`), with or without a migration —
+    downgrading across it stops working, and entries more than one schema major old can no
+    longer be upgraded. It's the clean-up point for old rename code, so it only happens in a
+    major release; see `docs/ARCHITECTURE.md` §4.
+  - Renaming or removing a stored setting *without* a migration (the user's choice is lost).
+    With one — a `RenamedOption` plus a `SCHEMA_MINOR_VERSION` bump — it's minor: the setting
+    carries over, and a downgrade to a release on the previous schema version keeps it too.
   - Renaming an existing entity `translation_key` — this is a cross-repo break, since
     `ha-dockhand-cards` resolves entities by `translation_key` (see that repo's
     `docs/ARCHITECTURE.md` §1). Coordinate a release on both sides when this happens.
@@ -46,6 +50,7 @@ or that removes something they may depend on:
 - A new optional config key, editor field, or card mode.
 - New locale coverage, or new translated strings alongside existing ones.
 - Any additive change where an existing config keeps working unmodified.
+- A stored setting renamed or moved with a migration (schema minor bump) — see Major above.
 
 ## Patch — no capability change
 

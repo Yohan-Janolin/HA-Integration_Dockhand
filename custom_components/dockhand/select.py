@@ -8,14 +8,14 @@ auto-revert safety check here — only the shared warnings-to-repair-issue
 handling.
 """
 
-from typing import Any
+from typing import Any, override
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -44,7 +44,7 @@ async def async_setup_entry(
     data = entry.runtime_data
 
     def _opt(key: str, default: Any) -> Any:
-        return entry.options.get(key, entry.data.get(key, default))
+        return entry.options.get(key, default)
 
     if not _opt(CONF_ENABLE_RUNTIME_CONTROLS, False):
         return
@@ -138,23 +138,27 @@ class DockhandContainerRestartPolicySelect(
         return (env.get("runtime_config") or {}).get(self._container_name) or {}
 
     @property
+    @override
     def available(self) -> bool:
         if self._container() is None or not super().available:
             return False
         env = _coordinator_env(self.coordinator.data, self._env_id)
         return "runtime_config" not in (env.get("fetch_failures") or set())
 
+    @override
     def _handle_coordinator_update(self) -> None:
         self._optimistic_value = None
         super()._handle_coordinator_update()
 
     @property
+    @override
     def current_option(self) -> str | None:
         if self._optimistic_value is not None:
             return self._optimistic_value
         value = self._runtime_config().get("restart_policy")
         return value if value in _RESTART_POLICY_OPTIONS else None
 
+    @override
     async def async_select_option(self, option: str) -> None:
         c = self._container()
         if not c:

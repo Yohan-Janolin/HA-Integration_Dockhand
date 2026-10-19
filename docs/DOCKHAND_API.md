@@ -8,7 +8,7 @@
 > TypeScript interfaces. It is NOT authoritative for request/response
 > shapes; verify against source before depending on exact fields.
 
-Total routes discovered: 257
+Total routes discovered: 279
 
 ## activity
 
@@ -63,7 +63,7 @@ Total routes discovered: 257
 - Source: `src/routes/api/auth/login/+server.ts`
 
 ### `POST` `/auth/logout`
-@openapi summary: Destroy the current session (clears the dockhand_session cookie) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-500: Unexpected error while destroying the session
+@openapi summary: Destroy the current session (clears the dockhand_session cookie) description: When the session came from an OIDC provider that publishes an end-session endpoint, the response carries a logoutUrl the caller should navigate to so the provider ends its own session too. Never present when the instance sets OIDC_END_SESSION=false. resp-200: {success:boolean!, logoutUrl:string} resp-200-example: {"success":true} resp-500: Unexpected error while destroying the session
 - Source: `src/routes/api/auth/logout/+server.ts`
 
 ### `GET, POST` `/auth/oidc`
@@ -75,7 +75,7 @@ Total routes discovered: 257
 - Source: `src/routes/api/auth/oidc/[id]/+server.ts`
 
 ### `GET, POST` `/auth/oidc/[id]/initiate`
-@openapi summary: Start the OIDC login flow for a provider — on success throws a 302 redirect to the IdP authorization URL path: id:integer! Numeric id of the OIDC provider (from GET /api/auth/oidc) query: redirect:string Post-login destination path to return to (defaults to /) resp-302: Redirect to the IdP's authorization URL resp-400: Authentication is not enabled, or the configuration id is invalid resp-404: OIDC provider not found or disabled resp-500: Failed to build the authorization URL / initiate SSO
+Send the browser back to the login form with the reason. This endpoint is reached by navigation, not fetch, so a JSON error body would be rendered as the page - and with auto-login on, reloading it just repeats the failure. `local=1` keeps the form up instead of bouncing straight out again.
 - Source: `src/routes/api/auth/oidc/[id]/initiate/+server.ts`
 
 ### `POST` `/auth/oidc/[id]/test`
@@ -85,8 +85,19 @@ Total routes discovered: 257
 ### `GET` `/auth/oidc/callback`
 - Source: `src/routes/api/auth/oidc/callback/+server.ts`
 
+### `POST` `/auth/passkeys/login/options`
+- Source: `src/routes/api/auth/passkeys/login/options/+server.ts`
+
+### `POST` `/auth/passkeys/login/verify`
+- Source: `src/routes/api/auth/passkeys/login/verify/+server.ts`
+
+### `POST` `/auth/passkeys/register/options`
+- Source: `src/routes/api/auth/passkeys/register/options/+server.ts`
+
+### `POST` `/auth/passkeys/register/verify`
+- Source: `src/routes/api/auth/passkeys/register/verify/+server.ts`
+
 ### `GET` `/auth/providers`
-@openapi summary: List the authentication providers offered on the login page (local, LDAP, OIDC), plus the default provider resp-200: {providers:array<{id:string!, name:string!, type:string!, initiateUrl:string}>, defaultProvider:string} resp-200-example: {"providers":[{"id":"local","name":"Local","type":"local"},{"id":"oidc:1","name":"Authentik","type":"oidc","initiateUrl":"/api/auth/oidc/1/initiate"}],"defaultProvider":"local"}
 - Source: `src/routes/api/auth/providers/+server.ts`
 
 ### `GET` `/auth/session`
@@ -94,7 +105,6 @@ Total routes discovered: 257
 - Source: `src/routes/api/auth/session/+server.ts`
 
 ### `GET, PUT` `/auth/settings`
-@openapi summary: Get the global authentication settings (whether auth is enabled and the default provider) resp-200: {authEnabled:boolean!, defaultProvider:string} resp-200-example: {"authEnabled":true,"defaultProvider":"local"} resp-401: Authentication required (auth is enabled and the caller is not authenticated) resp-403: Permission denied (missing settings:view) resp-500: Failed to read the auth settings
 - Source: `src/routes/api/auth/settings/+server.ts`
 
 ### `GET, POST` `/auth/tokens`
@@ -107,11 +117,11 @@ DELETE /api/auth/tokens/[id] - Revoke an API token @openapi summary: Revoke (per
 ## auto-update
 
 ### `GET` `/auto-update`
-Batch endpoint to get all auto-update settings for an environment. Returns a map of containerName -> settings for efficient lookup. @openapi summary: Get all enabled auto-update settings for an environment, keyed by container name query: env:integer Environment ID to read settings for (from GET /api/environments) resp-200: {} resp-200-example: {"web-1":{"enabled":true,"scheduleType":"daily","cronExpression":"0 3 * * *","vulnerabilityCriteria":"never"}} resp-500: Failed to get auto-update settings
+Batch endpoint to get all auto-update settings for an environment. Returns a map of containerName -> settings for efficient lookup. @openapi summary: Get all enabled auto-update settings for an environment, keyed by container name query: env:integer Environment ID to read settings for (from GET /api/environments) resp-200: {} resp-200-example: {"web-1":{"enabled":true,"scheduleType":"daily","cronExpression":"0 3 * * *","vulnerabilityCriteria":"never"}} resp-403: Permission denied (needs schedules:view, and access to the environment) resp-500: Failed to get auto-update settings
 - Source: `src/routes/api/auto-update/+server.ts`
 
 ### `DELETE, GET, POST` `/auto-update/[containerName]`
-@openapi summary: Get the auto-update setting for a container (returns sensible defaults when none is stored) path: containerName:string! Container name (URL-encoded) query: env:integer Environment the container belongs to (from GET /api/environments) resp-200: {enabled:boolean!, scheduleType:string!, cronExpression:string, vulnerabilityCriteria:string!} resp-200-example: {"enabled":false,"scheduleType":"daily","cronExpression":"0 3 * * *","vulnerabilityCriteria":"never"} resp-500: Failed to get auto-update setting
+@openapi summary: Get the auto-update setting for a container (returns sensible defaults when none is stored) path: containerName:string! Container name (URL-encoded) query: env:integer Environment the container belongs to (from GET /api/environments) resp-200: {enabled:boolean!, scheduleType:string!, cronExpression:string, vulnerabilityCriteria:string!} resp-200-example: {"enabled":false,"scheduleType":"daily","cronExpression":"0 3 * * *","vulnerabilityCriteria":"never"} resp-403: Permission denied, or no access to the environment resp-500: Failed to get auto-update setting
 - Source: `src/routes/api/auto-update/[containerName]/+server.ts`
 
 ## backup
@@ -184,6 +194,9 @@ Cancel a running restore (audit #14). Restore was previously uncancellable — t
 ### `GET` `/backup/snapshots/[id]/metadata`
 - Source: `src/routes/api/backup/snapshots/[id]/metadata/+server.ts`
 
+### `POST` `/backup/snapshots/batch-delete`
+- Source: `src/routes/api/backup/snapshots/batch-delete/+server.ts`
+
 ### `GET` `/backup/snapshots/diff`
 - Source: `src/routes/api/backup/snapshots/diff/+server.ts`
 
@@ -224,6 +237,16 @@ GET /api/changelog - Dockhand changelog @openapi summary: Return the bundled Doc
 ### `DELETE, GET, POST` `/container-icons/[name]`
 - Source: `src/routes/api/container-icons/[name]/+server.ts`
 
+## container-tags
+
+### `GET` `/container-tags`
+@openapi summary: List all container tag assignments for an environment as a name -> tagIds map description: Returns every container that has tags assigned in the given environment, so the containers list can render and filter by tag in one request instead of one lookup per row. query: env:integer Environment id resp-200: A JSON object mapping container name to its array of tag ids resp-200-example: {"plex":[1,5],"authelia":[3]} resp-403: Permission denied (needs containers:view)
+- Source: `src/routes/api/container-tags/+server.ts`
+
+### `GET, PUT` `/container-tags/[name]`
+@openapi summary: Get the tag ids assigned to one container (by name) path: name:string! Container name query: env:integer Environment id resp-200: {tagIds:array<integer>!} resp-200-example: {"tagIds":[3,7]} resp-403: Permission denied (needs containers:view)
+- Source: `src/routes/api/container-tags/[name]/+server.ts`
+
 ## containers
 
 ### `GET, POST` `/containers`
@@ -239,31 +262,39 @@ GET /api/changelog - Dockhand changelog @openapi summary: Return the bundled Doc
 Container Exec API POST: Creates an exec instance for terminal attachment Returns exec ID that can be used for WebSocket connection
 - Source: `src/routes/api/containers/[id]/exec/+server.ts`
 
+### `POST` `/containers/[id]/exec/run`
+One-shot container exec API POST: Runs a finite command in a container and returns { stdout, stderr, exitCode }. Unlike the interactive exec endpoint (which returns an execId for a terminal WebSocket), this waits for the command to finish and returns its result, so automation clients get a plain argv -> output + exit code contract.
+- Source: `src/routes/api/containers/[id]/exec/run/+server.ts`
+
 ### `GET` `/containers/[id]/files`
-GET /api/containers/{id}/files - List a directory inside a container @openapi summary: List the contents of a directory inside a container's filesystem path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) query: path:string Absolute directory path inside the container (default "/") query: simpleLs:boolean Use a lightweight `ls` listing instead of a full stat of each entry resp-200: Directory listing (entries with name, type, size and permission metadata) resp-403: Permission denied (needs containers:exec) resp-404: Container not found resp-500: Failed to list the directory
+GET /api/containers/{id}/files - List a directory inside a container @openapi summary: List the contents of a directory inside a container's filesystem path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) query: path:string Absolute directory path inside the container (default "/") query: simpleLs:boolean Use a lightweight `ls` listing instead of a full stat of each entry resp-200: Directory listing (entries with name, type, size and permission metadata) resp-403: Permission denied (needs containers:exec) resp-404: Container not found resp-500: Failed to list the directory
 - Source: `src/routes/api/containers/[id]/files/+server.ts`
 
 ### `POST` `/containers/[id]/files/chmod`
-POST /api/containers/{id}/files/chmod - Change permissions of a path in a container @openapi summary: Change the mode (permissions) of a file or directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) body: {path:string!, mode:string!, recursive:boolean} body-example: {"path":"/app/entrypoint.sh","mode":"755","recursive":false} resp-200: {success:boolean!, path:string!, mode:string!, recursive:boolean!} resp-200-example: {"success":true,"path":"/app/entrypoint.sh","mode":"755","recursive":false} resp-400: Path or mode missing, an invalid chmod mode, or the container is not running resp-403: Permission denied, read-only file system, or operation not permitted resp-404: Path not found resp-500: Failed to change permissions
+POST /api/containers/{id}/files/chmod - Change permissions of a path in a container @openapi summary: Change the mode (permissions) of a file or directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) body: {path:string!, mode:string!, recursive:boolean} body-example: {"path":"/app/entrypoint.sh","mode":"755","recursive":false} resp-200: {success:boolean!, path:string!, mode:string!, recursive:boolean!} resp-200-example: {"success":true,"path":"/app/entrypoint.sh","mode":"755","recursive":false} resp-400: Path or mode missing, an invalid chmod mode, or the container is not running resp-403: Permission denied, read-only file system, or operation not permitted resp-404: Path not found resp-500: Failed to change permissions
 - Source: `src/routes/api/containers/[id]/files/chmod/+server.ts`
 
+### `POST` `/containers/[id]/files/chown`
+POST /api/containers/{id}/files/chown - Change ownership of a path in a container @openapi summary: Change the owner (and optional group) of a file or directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) body: {path:string!, owner:string!, recursive:boolean} body-example: {"path":"/app/data","owner":"1000:1000","recursive":true} resp-200: {success:boolean!, path:string!, owner:string!, recursive:boolean!} resp-200-example: {"success":true,"path":"/app/data","owner":"1000:1000","recursive":true} resp-400: Path or owner missing, an invalid owner spec, or the container is not running resp-403: Permission denied, read-only file system, or operation not permitted resp-404: Path not found resp-500: Failed to change ownership
+- Source: `src/routes/api/containers/[id]/files/chown/+server.ts`
+
 ### `GET, PUT` `/containers/[id]/files/content`
-GET /api/containers/{id}/files/content - Read a file's content from a container @openapi summary: Read the content of a single file inside a container (max 1 MB) path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) query: path:string! Absolute file path inside the container resp-200: {content:string!, path:string!} resp-400: Path is missing, the target is a directory, or the container is not running resp-403: Permission denied to read the file (needs containers:exec) resp-404: File not found resp-413: File is larger than the 1 MB read limit resp-500: Failed to read the file
+GET /api/containers/{id}/files/content - Read a file's content from a container @openapi summary: Read the content of a single file inside a container (max 1 MB) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) query: path:string! Absolute file path inside the container resp-200: {content:string!, path:string!} resp-400: Path is missing, the target is a directory, or the container is not running resp-403: Permission denied to read the file (needs containers:exec) resp-404: File not found resp-413: File is larger than the 1 MB read limit resp-500: Failed to read the file
 - Source: `src/routes/api/containers/[id]/files/content/+server.ts`
 
 ### `POST` `/containers/[id]/files/create`
-POST /api/containers/{id}/files/create - Create a file or directory in a container @openapi summary: Create an empty file or a directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) body: {path:string!, type:string!} body-example: {"path":"/app/data","type":"directory"} resp-200: {success:boolean!, path:string!, type:string!} resp-200-example: {"success":true,"path":"/app/data","type":"directory"} resp-400: Path missing, type not "file" or "directory", or the container is not running resp-403: Permission denied resp-404: Parent directory not found resp-409: Path already exists resp-500: Failed to create the path
+POST /api/containers/{id}/files/create - Create a file or directory in a container @openapi summary: Create an empty file or a directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) body: {path:string!, type:string!, owner:string} body-example: {"path":"/app/data","type":"directory","owner":"1000:1000"} resp-200: {success:boolean!, path:string!, type:string!, owner:string} resp-200-example: {"success":true,"path":"/app/data","type":"directory","owner":"1000:1000"} resp-400: Path missing, type not "file" or "directory", or the container is not running resp-403: Permission denied resp-404: Parent directory not found resp-409: Path already exists resp-500: Failed to create the path
 - Source: `src/routes/api/containers/[id]/files/create/+server.ts`
 
 ### `DELETE` `/containers/[id]/files/delete`
-DELETE /api/containers/{id}/files/delete - Delete a path in a container @openapi summary: Delete a file or directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) query: path:string! Absolute path inside the container to delete resp-200: {success:boolean!, path:string!} resp-200-example: {"success":true,"path":"/app/tmp/old.log"} resp-400: Path missing, a refused critical-path delete, a non-empty directory, or the container is not running resp-403: Permission denied, or read-only file system resp-404: Path not found resp-500: Failed to delete the path
+DELETE /api/containers/{id}/files/delete - Delete a path in a container @openapi summary: Delete a file or directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) query: path:string! Absolute path inside the container to delete resp-200: {success:boolean!, path:string!} resp-200-example: {"success":true,"path":"/app/tmp/old.log"} resp-400: Path missing, a refused critical-path delete, a non-empty directory, or the container is not running resp-403: Permission denied, or read-only file system resp-404: Path not found resp-500: Failed to delete the path
 - Source: `src/routes/api/containers/[id]/files/delete/+server.ts`
 
 ### `GET` `/containers/[id]/files/download`
 - Source: `src/routes/api/containers/[id]/files/download/+server.ts`
 
 ### `POST` `/containers/[id]/files/rename`
-POST /api/containers/{id}/files/rename - Rename/move a path in a container @openapi summary: Rename or move a file or directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) body: {oldPath:string!, newPath:string!} body-example: {"oldPath":"/app/config.yaml","newPath":"/app/config.old.yaml"} resp-200: {success:boolean!, oldPath:string!, newPath:string!} resp-200-example: {"success":true,"oldPath":"/app/config.yaml","newPath":"/app/config.old.yaml"} resp-400: oldPath or newPath missing, or the container is not running resp-403: Permission denied, or read-only file system resp-404: Source path not found resp-409: Destination already exists resp-500: Failed to rename the path
+POST /api/containers/{id}/files/rename - Rename/move a path in a container @openapi summary: Rename or move a file or directory inside a container (requires the 'exec' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) body: {oldPath:string!, newPath:string!} body-example: {"oldPath":"/app/config.yaml","newPath":"/app/config.old.yaml"} resp-200: {success:boolean!, oldPath:string!, newPath:string!} resp-200-example: {"success":true,"oldPath":"/app/config.yaml","newPath":"/app/config.old.yaml"} resp-400: oldPath or newPath missing, or the container is not running resp-403: Permission denied, or read-only file system resp-404: Source path not found resp-409: Destination already exists resp-500: Failed to rename the path
 - Source: `src/routes/api/containers/[id]/files/rename/+server.ts`
 
 ### `POST` `/containers/[id]/files/upload`
@@ -274,7 +305,7 @@ Create a simple tar archive from a single file TAR format: 512-byte header follo
 - Source: `src/routes/api/containers/[id]/inspect/+server.ts`
 
 ### `GET` `/containers/[id]/logs`
-GET /api/containers/{id}/logs - Read container logs (non-streaming) @openapi summary: Return the last N lines of a container's combined stdout/stderr logs as a single string path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) query: tail:integer Number of trailing log lines to return (default 100) query: since:string Only return logs since this time (Unix timestamp or Docker duration, e.g. 10m) query: until:string Only return logs before this time (Unix timestamp or Docker duration) resp-200: {logs:string!} resp-403: Permission denied resp-500: Failed to read the container logs
+GET /api/containers/{id}/logs - Read container logs (non-streaming) @openapi summary: Return the last N lines of a container's combined stdout/stderr logs as a single string path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) query: tail:integer Number of trailing log lines to return (default 100) query: since:string Only return logs since this time (Unix timestamp or Docker duration, e.g. 10m) query: until:string Only return logs before this time (Unix timestamp or Docker duration) resp-200: {logs:string!} resp-403: Permission denied resp-500: Failed to read the container logs
 - Source: `src/routes/api/containers/[id]/logs/+server.ts`
 
 ### `GET` `/containers/[id]/logs/stream`
@@ -282,36 +313,36 @@ GET /api/containers/{id}/logs - Read container logs (non-streaming) @openapi sum
 - Source: `src/routes/api/containers/[id]/logs/stream/+server.ts`
 
 ### `POST` `/containers/[id]/pause`
-POST /api/containers/{id}/pause - Pause a container @openapi summary: Pause all processes in a running container (requires the container 'stop' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied resp-500: Failed to pause the container
+POST /api/containers/{id}/pause - Pause a container @openapi summary: Pause all processes in a running container (requires the container 'stop' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied resp-500: Failed to pause the container
 - Source: `src/routes/api/containers/[id]/pause/+server.ts`
 
 ### `POST` `/containers/[id]/rename`
-POST /api/containers/{id}/rename - Rename a container @openapi summary: Rename a container and update any associated auto-update schedule (requires the 'create' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) body: {name:string!} body-example: {"name":"my-renamed-container"} resp-200: {success:boolean!} resp-200-example: {"success":true} resp-400: The new name is missing or not a string resp-403: Permission denied resp-404: Container not found resp-500: Failed to rename the container
+POST /api/containers/{id}/rename - Rename a container @openapi summary: Rename a container and update any associated auto-update schedule (requires the 'create' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) body: {name:string!} body-example: {"name":"my-renamed-container"} resp-200: {success:boolean!} resp-200-example: {"success":true} resp-400: The new name is missing or not a string resp-403: Permission denied resp-404: Container not found resp-500: Failed to rename the container
 - Source: `src/routes/api/containers/[id]/rename/+server.ts`
 
 ### `POST` `/containers/[id]/restart`
-POST /api/containers/{id}/restart - Restart a container @openapi summary: Restart a container path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied, or (enterprise) no access to the requested environment resp-404: Container not found resp-500: Failed to restart the container
+POST /api/containers/{id}/restart - Restart a container @openapi summary: Restart a container path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied, or (enterprise) no access to the requested environment resp-404: Container not found resp-500: Failed to restart the container
 - Source: `src/routes/api/containers/[id]/restart/+server.ts`
 
 ### `GET` `/containers/[id]/shells`
 - Source: `src/routes/api/containers/[id]/shells/+server.ts`
 
 ### `POST` `/containers/[id]/start`
-POST /api/containers/{id}/start - Start a container @openapi summary: Start a stopped container path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied, or (enterprise) no access to the requested environment resp-404: Container not found resp-500: Failed to start the container
+POST /api/containers/{id}/start - Start a container @openapi summary: Start a stopped container path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied, or (enterprise) no access to the requested environment resp-404: Container not found resp-500: Failed to start the container
 - Source: `src/routes/api/containers/[id]/start/+server.ts`
 
 ### `GET` `/containers/[id]/stats`
 - Source: `src/routes/api/containers/[id]/stats/+server.ts`
 
 ### `POST` `/containers/[id]/stop`
-POST /api/containers/{id}/stop - Stop a container @openapi summary: Stop a running container path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied, or (enterprise) no access to the requested environment resp-404: Container not found resp-500: Failed to stop the container
+POST /api/containers/{id}/stop - Stop a container @openapi summary: Stop a running container path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied, or (enterprise) no access to the requested environment resp-404: Container not found resp-500: Failed to stop the container
 - Source: `src/routes/api/containers/[id]/stop/+server.ts`
 
 ### `GET` `/containers/[id]/top`
 - Source: `src/routes/api/containers/[id]/top/+server.ts`
 
 ### `POST` `/containers/[id]/unpause`
-POST /api/containers/{id}/unpause - Unpause a container @openapi summary: Resume all processes in a paused container (requires the container 'start' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied resp-500: Failed to unpause the container
+POST /api/containers/{id}/unpause - Unpause a container @openapi summary: Resume all processes in a paused container (requires the container 'start' permission) path: id:string! Container ID or name (from GET /api/containers) query: env:integer! The target environment ID the container lives in (from GET /api/environments) resp-200: {success:boolean!} resp-200-example: {"success":true} resp-403: Permission denied resp-500: Failed to unpause the container
 - Source: `src/routes/api/containers/[id]/unpause/+server.ts`
 
 ### `POST` `/containers/[id]/update`
@@ -337,11 +368,10 @@ POST /api/containers/[id]/update-runtime In-place update of a running container'
 - Source: `src/routes/api/containers/check-updates/+server.ts`
 
 ### `DELETE, GET` `/containers/pending-updates`
-Get pending container updates for an environment. @openapi summary: List the containers in an environment that have a pending image update recorded (requires the 'view' permission) query: env:integer! The target environment ID (required) (from GET /api/environments) resp-200: {environmentId:integer!, pendingUpdates:array<{containerId:string!, containerName:string!, currentImage:string!, checkedAt:string!, hasImageUpdate:boolean!, newerVersion:object}>!} resp-400: Environment ID is required resp-403: Permission denied resp-500: Failed to get the pending updates
 - Source: `src/routes/api/containers/pending-updates/+server.ts`
 
 ### `GET` `/containers/sizes`
-GET /api/containers/sizes - List containers with their on-disk sizes @openapi summary: List all containers in an environment together with their writable-layer and root-filesystem sizes (requires the 'view' permission) query: env:integer The target environment ID (omit for the local/default Docker host) (from GET /api/environments) resp-200: Array of containers with size metadata (SizeRw / SizeRootFs) resp-403: Permission denied resp-500: Failed to get container sizes (returns an empty object)
+GET /api/containers/sizes - List containers with their on-disk sizes @openapi summary: List all containers in an environment together with their writable-layer and root-filesystem sizes (requires the 'view' permission) query: env:integer! The target environment ID the container lives in (from GET /api/environments) resp-200: Array of containers with size metadata (SizeRw / SizeRootFs) resp-403: Permission denied resp-500: Failed to get container sizes (returns an empty object)
 - Source: `src/routes/api/containers/sizes/+server.ts`
 
 ### `GET` `/containers/stats`
@@ -389,7 +419,7 @@ Memory Debug Endpoint Returns Node.js memory stats for monitoring. Only availabl
 - Source: `src/routes/api/environments/[id]/+server.ts`
 
 ### `GET, POST` `/environments/[id]/disk-warning`
-@openapi summary: Get the disk-space warning thresholds for an environment path: id:integer! Environment id (from GET /api/environments) resp-200: {enabled:boolean!, mode:string!, threshold:integer!, thresholdGb:integer!} resp-200-example: {"enabled":true,"mode":"percentage","threshold":80,"thresholdGb":50} resp-403: Permission denied (RBAC 'environments:view' missing) resp-404: Environment not found resp-500: Unexpected error while loading the settings
+@openapi summary: Get the disk-space warning thresholds for an environment description: percentageSupported and storageDriver are null when the host could not be reached, which means unknown rather than unsupported - only false says the host reports no storage pool size and so percentage warnings would never fire there. path: id:integer! Environment id (from GET /api/environments) resp-200: {enabled:boolean!, mode:string!, threshold:integer!, thresholdGb:integer!, percentageSupported:boolean, storageDriver:string} resp-200-example: {"enabled":true,"mode":"percentage","threshold":80,"thresholdGb":50,"percentageSupported":false,"storageDriver":"overlay2"} resp-403: Permission denied (RBAC 'environments:view' missing) resp-404: Environment not found resp-500: Unexpected error while loading the settings
 - Source: `src/routes/api/environments/[id]/disk-warning/+server.ts`
 
 ### `DELETE, GET, POST` `/environments/[id]/icon`
@@ -409,6 +439,9 @@ Get image prune settings for an environment. @openapi summary: Get the automatic
 ### `GET, POST` `/environments/[id]/remote-stacks-dir`
 - Source: `src/routes/api/environments/[id]/remote-stacks-dir/+server.ts`
 
+### `GET, POST` `/environments/[id]/report`
+- Source: `src/routes/api/environments/[id]/report/+server.ts`
+
 ### `POST` `/environments/[id]/test`
 - Source: `src/routes/api/environments/[id]/test/+server.ts`
 
@@ -417,13 +450,16 @@ Map of modern IANA timezone names to their canonical equivalents recognized by I
 - Source: `src/routes/api/environments/[id]/timezone/+server.ts`
 
 ### `GET, POST` `/environments/[id]/update-check`
-Get update check settings for an environment. @openapi summary: Get the automatic container-image update-check schedule for an environment path: id:integer! Environment id (from GET /api/environments) resp-200: {settings:{enabled:boolean!, cron:string!, autoUpdate:boolean!, vulnerabilityCriteria:string!}!} resp-200-example: {"settings":{"enabled":false,"cron":"0 4 * * *","autoUpdate":false,"vulnerabilityCriteria":"never"}} resp-403: Permission denied (RBAC 'environments:view' missing) resp-404: Environment not found resp-500: Unexpected error while loading the settings
 - Source: `src/routes/api/environments/[id]/update-check/+server.ts`
 
 ### `GET` `/environments/detect-socket`
-Detect available Docker sockets on the system @openapi summary: Detect common Docker/Podman socket paths that exist on the Dockhand host resp-200: {sockets:array<{path:string!, name:string!, exists:boolean!}>!, homedir:string!} resp-200-example: {"sockets":[{"path":"/var/run/docker.sock","name":"Docker (default)","exists":true}],"homedir":"/home/dockhand"}
+Detect available Docker sockets on the system @openapi summary: Detect common Docker/Podman socket paths that exist on the Dockhand host resp-200: {sockets:array<{path:string!, name:string!, exists:boolean!}>!, homedir:string!} resp-200-example: {"sockets":[{"path":"/var/run/docker.sock","name":"Docker (default)","exists":true}],"homedir":"/home/dockhand"} resp-403: Permission denied (needs environments:create or environments:edit)
 - Local interfaces: `DetectedSocket`
 - Source: `src/routes/api/environments/detect-socket/+server.ts`
+
+### `GET` `/environments/report`
+@openapi summary: Export an environment state report as a downloadable file description: Inventory, vulnerability counts and scan coverage for one environment or for every environment the caller may see. Requires a valid paid license of either tier. The change history is included only for an enterprise license, because it is the audit log under another name. query: env:integer One environment id; omit to report on every accessible environment query: format:string Output format - json (default), csv, or pdf resp-200: The report as a downloadable json, csv or pdf attachment resp-400: The env query parameter is not a number resp-401: Authentication required resp-403: A paid license is required, or permission denied resp-404: No accessible environment matches the requested id resp-500: Failed to build the report
+- Source: `src/routes/api/environments/report/+server.ts`
 
 ### `POST` `/environments/test`
 - Local interfaces: `TestConnectionRequest`
@@ -432,7 +468,7 @@ Detect available Docker sockets on the system @openapi summary: Detect common Do
 ## events
 
 ### `GET` `/events`
-@openapi summary: Stream live Docker events (container/image/volume/network) for an environment via SSE, with periodic heartbeats query: env:integer Environment id — without it, an "info" SSE message is sent and the stream ends (from GET /api/environments) resp-200: text/event-stream SSE stream ("connected", "heartbeat" every 5s, "docker" events with {type,action,actor,time,timeNano}, or an "error"/"info" event for edge environments, missing/unknown environment, or a lost Docker connection)
+@openapi summary: Stream live Docker events (container/image/volume/network) for an environment via SSE, with periodic heartbeats query: env:integer Environment id — without it, an "info" SSE message is sent and the stream ends (from GET /api/environments) resp-200: text/event-stream SSE stream ("connected", "heartbeat" every 5s, "docker" events with {type,action,actor,time,timeNano}, or an "error"/"info" event for edge environments, missing/unknown environment, or a lost Docker connection) resp-403: Permission denied, or no access to the environment
 - Source: `src/routes/api/events/+server.ts`
 
 ## git
@@ -543,7 +579,7 @@ Database Health Check Endpoint Public endpoint suitable for external monitoring.
 - Source: `src/routes/api/icons/selfhst/[ref]/+server.ts`
 
 ### `POST` `/icons/selfhst/batch`
-POST /api/icons/selfhst/batch - resolve many selfh.st icons in ONE request. The icon picker renders a grid of app logos; fetching each as its own <img src="/api/icons/selfhst/<ref>"> makes dozens of distinct requests in a second, which a WAF (CrowdSec) flags as crawling/probing and blocks the client (#1467). This batches them: the client asks for all visible refs at once and gets one response, so the WAF sees a single request. Refs that can't be resolved are simply omitted (no per-icon 404s, which also read as probing). Each icon is returned as a `data:image/svg+xml` URI so the picker keeps rendering via <img> (script-inert) rather than inlining SVG markup - the SVG sanitizer was designed for the <img>+CSP path, so we don't weaken it by switching to {@html}. @openapi summary: Resolve multiple selfh.st app icons in one request (avoids per-icon requests a WAF flags as crawling) description: Takes a list of selfh.st icon references and returns each resolved icon as a data:image/svg+xml URI, keyed by reference. Unresolvable or invalid refs are omitted rather than returned as errors. Each icon is fetched from the CDN once and cached on disk, same as the single-icon endpoint. body: {refs:array<string>!} body-example: {"refs":["plex","gitea","grafana"]} resp-200: {icons:object!} resp-200-desc: icons maps each resolved reference to a data:image/svg+xml base64 URI; unresolvable refs are omitted. resp-200-example: {"icons":{"plex":"data:image/svg+xml;base64,PHN2Zy4uLg=="}} resp-400: The request body is missing a refs array
+POST /api/icons/selfhst/batch - resolve many selfh.st icons in ONE request. The icon picker renders a grid of app logos; fetching each as its own <img src="/api/icons/selfhst/<ref>"> makes dozens of distinct requests in a second, which a WAF (CrowdSec) flags as crawling/probing and blocks the client (#1467). This batches them: the client asks for all visible refs at once and gets one response, so the WAF sees a single request. Refs that can't be resolved are simply omitted (no per-icon 404s, which also read as probing). Each icon is returned as a `data:` URI (image/svg+xml, image/webp, or image/png) so the picker keeps rendering via <img> (script-inert) rather than inlining SVG markup - the SVG sanitizer was designed for the <img>+CSP path, so we don't weaken it by switching to {@html}. @openapi summary: Resolve multiple selfh.st app icons in one request (avoids per-icon requests a WAF flags as crawling) description: Takes a list of selfh.st icon references and returns each resolved icon as a data: URI (image/svg+xml, image/webp, or image/png depending on the format available), keyed by reference. Unresolvable or invalid refs are omitted rather than returned as errors. Each icon is fetched from the CDN once and cached on disk, same as the single-icon endpoint. body: {refs:array<string>!} body-example: {"refs":["plex","gitea","grafana"]} resp-200: {icons:object!} resp-200-desc: icons maps each resolved reference to a data: base64 URI in the format available (svg/webp/png); unresolvable refs are omitted. resp-200-example: {"icons":{"plex":"data:image/svg+xml;base64,PHN2Zy4uLg=="}} resp-400: The request body is missing a refs array
 - Source: `src/routes/api/icons/selfhst/batch/+server.ts`
 
 ## images
@@ -557,7 +593,6 @@ DELETE /api/images/{id} - Remove a Docker image @openapi summary: Remove a Docke
 - Source: `src/routes/api/images/[id]/+server.ts`
 
 ### `GET` `/images/[id]/export`
-GET /api/images/{id}/export - Download an image as a tar (optionally gzipped) @openapi summary: Export a Docker image as a downloadable tar (or tar.gz) stream path: id:string! Image ID or name to export (from GET /api/images) query: env:integer ID of the environment the image belongs to (from GET /api/environments) query: compress:boolean Gzip the tar stream and serve it as .tar.gz (default false) resp-200: The image tar (application/x-tar) or gzipped tar (application/gzip) as an attachment resp-403: Permission denied resp-500: Docker returned no response body, or the export failed
 - Source: `src/routes/api/images/[id]/export/+server.ts`
 
 ### `GET` `/images/[id]/history`
@@ -610,6 +645,7 @@ GET /api/jobs/[id] Poll a job's status and accumulated lines. Returns all lines 
 ## license
 
 ### `DELETE, GET, POST` `/license`
+@openapi summary: Get the current license status plus the server hostname the license is bound to description: Any authenticated caller sees whether a license is active and who it is issued to, because the UI decides what to offer from that. The key itself is included only for a caller holding license:manage. resp-200: The license status object merged with the current hostname resp-401: Authentication required (auth is enabled and the caller is not authenticated) resp-500: Failed to read the license status
 - Source: `src/routes/api/license/+server.ts`
 
 ## logs
@@ -629,11 +665,9 @@ GET /api/jobs/[id] Poll a job's status and accumulated lines. Returns all lines 
 - Source: `src/routes/api/networks/[id]/+server.ts`
 
 ### `POST` `/networks/[id]/connect`
-@openapi summary: Connect a container to a Docker network description: containerId from GET /api/containers. path: id:string! Docker network ID (from GET /api/networks) query: env:integer Environment the network belongs to (from GET /api/environments) body: {containerId:string!, containerName:string} body-example: {"containerId":"a1b2c3d4e5f6","containerName":"web-1"} resp-200: {success:boolean!} resp-200-example: {"success":true} resp-400: Container ID is required resp-403: Permission denied resp-500: Failed to connect container to network
 - Source: `src/routes/api/networks/[id]/connect/+server.ts`
 
 ### `POST` `/networks/[id]/disconnect`
-@openapi summary: Disconnect a container from a Docker network (optionally forcing the disconnect) description: containerId from GET /api/containers. path: id:string! Docker network ID (from GET /api/networks) query: env:integer Environment the network belongs to (from GET /api/environments) body: {containerId:string!, containerName:string, force:boolean} body-example: {"containerId":"a1b2c3d4e5f6","containerName":"web-1","force":false} resp-200: {success:boolean!} resp-200-example: {"success":true} resp-400: Container ID is required resp-403: Permission denied resp-500: Failed to disconnect container from network
 - Source: `src/routes/api/networks/[id]/disconnect/+server.ts`
 
 ### `GET` `/networks/[id]/inspect`
@@ -658,10 +692,14 @@ GET /api/jobs/[id] Poll a job's status and accumulated lines. Returns all lines 
 - Source: `src/routes/api/notifications/test/+server.ts`
 
 ### `GET, POST` `/notifications/trigger-test`
-Test endpoint to trigger notifications for any event type. This is intended for development/testing purposes only. @openapi summary: Trigger a real notification for a given event type (development/testing helper) description: environmentId from GET /api/environments. body: {eventType:string!, environmentId:integer, payload:{title:string!, message:string!, type:string}} body-example: {"eventType":"container_unhealthy","environmentId":1,"payload":{"title":"Container unhealthy","message":"web-1 is unhealthy","type":"warning"}} resp-200: {success:boolean!, sent:integer, eventType:string!, environmentId:integer} resp-200-example: {"success":true,"sent":1,"eventType":"container_unhealthy","environmentId":1} resp-400: eventType required, payload with title and message required, unknown event type, or environmentId missing for a non-system event resp-500: Unknown error while sending the notification
+Trigger a notification for a given event type. Named a test helper, but it delivers for real: whatever channels the environment has configured receive the message, so it is gated like sending is. @openapi summary: Trigger a real notification for a given event type (development/testing helper) description: Delivers to the configured channels for real, so it requires notifications:test and access to the environment. environmentId from GET /api/environments. body: {eventType:string!, environmentId:integer, payload:{title:string!, message:string!, type:string}} body-example: {"eventType":"container_unhealthy","environmentId":1,"payload":{"title":"Container unhealthy","message":"web-1 is unhealthy","type":"warning"}} resp-200: {success:boolean!, sent:integer, eventType:string!, environmentId:integer} resp-200-example: {"success":true,"sent":1,"eventType":"container_unhealthy","environmentId":1} resp-400: eventType required, payload with title and message required, unknown event type, or environmentId missing for a non-system event resp-401: Not authenticated resp-403: Permission denied (missing notifications:test, or no access to the environment) resp-500: Unknown error while sending the notification
 - Source: `src/routes/api/notifications/trigger-test/+server.ts`
 
 ## preferences
+
+### `DELETE, GET, POST` `/preferences/environment-order`
+Per-user when auth is on, app-wide when it is off - same as the sidebar's.
+- Source: `src/routes/api/preferences/environment-order/+server.ts`
 
 ### `GET, POST` `/preferences/favorite-groups`
 - Local interfaces: `FavoriteGroup`
@@ -679,6 +717,10 @@ Test endpoint to trigger notifications for any event type. This is intended for 
 @openapi summary: Retrieve the saved sidebar menu preferences (order and hidden items) resp-200: {preferences:{order:array<string>, hidden:array<string>}} resp-200-example: {"preferences":{"order":["dashboard","containers"],"hidden":["volumes"]}} resp-500: Failed to get sidebar preferences
 - Source: `src/routes/api/preferences/sidebar/+server.ts`
 
+### `DELETE, GET, POST` `/preferences/tag-order`
+Per-user when auth is on, app-wide when it is off - same as the sidebar's.
+- Source: `src/routes/api/preferences/tag-order/+server.ts`
+
 ## profile
 
 ### `GET, PUT` `/profile`
@@ -688,8 +730,14 @@ Test endpoint to trigger notifications for any event type. This is intended for 
 @openapi summary: Upload the authenticated user's avatar as a base64 image data URL (max ~500KB) body: {avatar:string!} body-example: {"avatar":"data:image/png;base64,iVBORw0KGgo..."} resp-200: {success:boolean!, avatar:string!} resp-400: Authentication is not enabled, avatar data missing, not an image data URL, or image too large (>500KB) resp-401: Not authenticated resp-500: Failed to upload the avatar
 - Source: `src/routes/api/profile/avatar/+server.ts`
 
+### `GET` `/profile/passkeys`
+@openapi summary: List the signed-in user's passkeys description: Names and metadata only; no credential material is returned. `enabled` reports whether this instance currently offers passkeys, so the profile can hide the controls without a second request; existing passkeys are still listed when it is false. resp-200-desc: The user's registered passkeys resp-400: Authentication is not enabled resp-401: Not authenticated
+- Source: `src/routes/api/profile/passkeys/+server.ts`
+
+### `DELETE` `/profile/passkeys/[id]`
+- Source: `src/routes/api/profile/passkeys/[id]/+server.ts`
+
 ### `GET, PUT` `/profile/preferences`
-@openapi summary: Get the current user's UI preferences (theme, fonts, editor options) resp-400: Not authenticated / no user in context resp-401: Not authenticated resp-500: Failed to load preferences
 - Source: `src/routes/api/profile/preferences/+server.ts`
 
 ## prune
@@ -756,7 +804,7 @@ Thrown when the registry refuses catalog listing to a valid token (GitLab/Harbor
 ## roles
 
 ### `GET, POST` `/roles`
-@openapi summary: List all roles (built-in and custom); available in setup mode or with an enterprise license resp-200: array<{id:integer!, name:string!, description:string, isSystem:boolean!, permissions:{}}> resp-403: Enterprise license required resp-500: Failed to read the roles
+@openapi summary: List all roles (built-in and custom); needs admin or users:view, plus an enterprise license resp-200: array<{id:integer!, name:string!, description:string, isSystem:boolean!, permissions:{}}> resp-403: Enterprise license required, or the account may not view users resp-500: Failed to read the roles
 - Source: `src/routes/api/roles/+server.ts`
 
 ### `DELETE, GET, PUT` `/roles/[id]`
@@ -815,6 +863,10 @@ Schedules Stream API - Real-time schedule updates via SSE GET /api/schedules/str
 ### `POST` `/secret-providers/[id]/test`
 - Source: `src/routes/api/secret-providers/[id]/test/+server.ts`
 
+### `GET, PUT` `/secret-providers/default`
+@openapi summary: Get the global default secret provider preselected for new stacks description: Returns null when no default is set, or when the stored provider no longer exists. resp-200: {providerId:integer} resp-403: Permission denied (needs secrets:view) resp-500: Failed to read the default secret provider
+- Source: `src/routes/api/secret-providers/default/+server.ts`
+
 ### `POST` `/secret-providers/test`
 Test a provider config before it's persisted to the database. @openapi summary: Test an unsaved provider config (before creating the provider) body: {type:string!, config:object!} body-example: {"type":"vault","config":{"host":"https://vault.example.com","mount":"secret","token":"hvs...."}} resp-200: {ok:boolean!, error:string} resp-200-desc: ok=false carries the reason (invalid type, missing config, or a connection error) - still 200 so the form shows it inline resp-400: Invalid request body resp-403: Permission denied (needs secrets:create)
 - Source: `src/routes/api/secret-providers/test/+server.ts`
@@ -837,6 +889,10 @@ Fetch from the local Docker directly. Supports TCP and Unix socket.
 - Local interfaces: `GeneralSettings`
 - Source: `src/routes/api/settings/general/+server.ts`
 
+### `GET, POST` `/settings/minimum-release-age`
+@openapi summary: Get the minimum image age in hours (creation time, with first-observed fallback) resp-200: {hours:number!, overridden:boolean!, inherited:boolean!} resp-403: Permission denied (needs settings:view)
+- Source: `src/routes/api/settings/minimum-release-age/+server.ts`
+
 ### `GET, PUT` `/settings/navigation`
 - Source: `src/routes/api/settings/navigation/+server.ts`
 
@@ -849,12 +905,23 @@ Fetch from the local Docker directly. Supports TCP and Unix socket.
 - Source: `src/routes/api/settings/scanner/cache/+server.ts`
 
 ### `GET, POST` `/settings/semver`
-@openapi summary: Get the global newer-version-tag (semver) detection config resp-200: {enabled:boolean!, maxBump:string!, matchFlavor:boolean!, includePrerelease:boolean!} resp-200-example: {"enabled":true,"maxBump":"minor","matchFlavor":true,"includePrerelease":false}
+@openapi summary: Get the global newer-version-tag (semver) detection config resp-200: {enabled:boolean!, maxBump:string!, matchFlavor:boolean!, includePrerelease:boolean!, rejectOlderImages:boolean!} resp-200-example: {"enabled":true,"maxBump":"minor","matchFlavor":true,"includePrerelease":false,"rejectOlderImages":true} resp-403: Permission denied (needs settings:view)
 - Source: `src/routes/api/settings/semver/+server.ts`
 
 ### `GET` `/settings/theme`
 Public endpoint for theme settings - no authentication required. Used by the login page to apply the app-level theme before user is authenticated.
 - Source: `src/routes/api/settings/theme/+server.ts`
+
+## stack-stats
+
+### `GET` `/stack-stats`
+- Source: `src/routes/api/stack-stats/+server.ts`
+
+## stack-tags
+
+### `GET` `/stack-tags`
+@openapi summary: List all stack tag assignments for an environment as a name -> tagIds map description: Returns every stack that has tags assigned in the given environment, so the stacks list can render and filter by tag in one request. query: env:integer Environment id resp-200: A JSON object mapping stack name to its array of tag ids resp-200-example: {"nextcloud":[2],"traefik":[4]} resp-403: Permission denied (needs stacks:view)
+- Source: `src/routes/api/stack-tags/+server.ts`
 
 ## stacks
 
@@ -882,7 +949,6 @@ GET /api/stacks/[name]/deploys?env=X List of deploy runs recorded for this stack
 - Source: `src/routes/api/stacks/[name]/deploys/+server.ts`
 
 ### `DELETE, GET` `/stacks/[name]/deploys/[runId]`
-GET /api/stacks/[name]/deploys/[runId] A single deploy run with all its metadata (no log text -- see .../log).
 - Source: `src/routes/api/stacks/[name]/deploys/[runId]/+server.ts`
 
 ### `GET` `/stacks/[name]/deploys/[runId]/log`
@@ -890,38 +956,41 @@ GET /api/stacks/[name]/deploys/[runId]/log The run's protocol text, straight fro
 - Source: `src/routes/api/stacks/[name]/deploys/[runId]/log/+server.ts`
 
 ### `POST` `/stacks/[name]/down`
-@openapi summary: Take a stack down (docker compose down — removes containers, keeps files), asynchronously path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment id (from GET /api/environments) body: {removeVolumes:boolean} body-example: {"removeVolumes":false} resp-200: {jobId:string!} resp-200-desc: Fire-and-forget job id — poll GET /api/jobs/{jobId} for the result. Send "Accept: application/json" (without text/event-stream) to instead block and receive the final {success,output|error} synchronously. resp-200-example: {"jobId":"3f9c5b1a-2e4d-4a6f-9b0a-1c7d8e9f0a1b"} resp-403: Permission denied, or access denied to this environment
+@openapi summary: Take a stack down (docker compose down — removes containers, keeps files), asynchronously path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment id (from GET /api/environments) body: {removeVolumes:boolean} body-example: {"removeVolumes":false} resp-400: Invalid stack name resp-200: {jobId:string!} resp-200-desc: Fire-and-forget job id — poll GET /api/jobs/{jobId} for the result. Send "Accept: application/json" (without text/event-stream) to instead block and receive the final {success,output|error} synchronously. resp-200-example: {"jobId":"3f9c5b1a-2e4d-4a6f-9b0a-1c7d8e9f0a1b"} resp-403: Permission denied, or access denied to this environment
 - Source: `src/routes/api/stacks/[name]/down/+server.ts`
 
 ### `GET, PUT` `/stacks/[name]/env`
 - Source: `src/routes/api/stacks/[name]/env/+server.ts`
 
 ### `GET, PUT` `/stacks/[name]/env/raw`
-GET /api/stacks/[name]/env/raw?env=X @openapi summary: Get the raw .env file content as-is (comments and formatting preserved) for a stack path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment ID the stack belongs to (from GET /api/environments) resp-200: {content:string!, noEnvFile:boolean} resp-200-example: {"content":"FOO=bar\n# comment\nBAZ=qux\n"} resp-403: Permission denied (requires stacks:view, or environment access denied on enterprise) resp-500: Failed to get environment file
 - Source: `src/routes/api/stacks/[name]/env/raw/+server.ts`
 
 ### `POST` `/stacks/[name]/env/validate`
-Docker and Compose built-in env vars consumed implicitly at runtime (not via ${} interpolation)
 - Local interfaces: `ValidationResult`
 - Source: `src/routes/api/stacks/[name]/env/validate/+server.ts`
 
 ### `DELETE, GET, POST` `/stacks/[name]/icon`
+@openapi summary: Get a stack's uploaded custom icon (raw image/webp bytes, not JSON) path: name:string! Stack name query: env:integer Environment id the stack belongs to resp-200: Binary image/webp response body, Cache-Control public max-age=3600 resp-403: Permission denied (needs stacks:view) resp-404: No custom icon set for this stack
 - Source: `src/routes/api/stacks/[name]/icon/+server.ts`
 
 ### `POST` `/stacks/[name]/relocate`
 - Source: `src/routes/api/stacks/[name]/relocate/+server.ts`
 
 ### `POST` `/stacks/[name]/restart`
-@openapi summary: Restart a stack (mode=restart|ordered|recreate); progress and the final result stream over Server-Sent Events path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment ID the stack belongs to (from GET /api/environments) query: mode:string Restart mode — "recreate" recreates containers (new IDs, re-pull), "ordered" does a stop+start honoring depends_on ordering (same IDs), anything else is a plain in-place restart resp-200: Server-Sent-Events job stream with a final result event ({success, output}) resp-403: Permission denied (requires stacks:restart, or environment access denied on enterprise)
+@openapi summary: Restart a stack (mode=restart|ordered|recreate); progress and the final result stream over Server-Sent Events path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment ID the stack belongs to (from GET /api/environments) query: mode:string Restart mode — "recreate" recreates containers (new IDs, re-pull), "ordered" does a stop+start honoring depends_on ordering (same IDs), anything else is a plain in-place restart resp-400: Invalid stack name resp-200: Server-Sent-Events job stream with a final result event ({success, output}) resp-403: Permission denied (requires stacks:restart, or environment access denied on enterprise)
 - Source: `src/routes/api/stacks/[name]/restart/+server.ts`
 
 ### `POST` `/stacks/[name]/start`
-@openapi summary: Start a stack (docker compose start/up), asynchronously path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment id (from GET /api/environments) resp-200: {jobId:string!} resp-200-desc: Fire-and-forget job id — poll GET /api/jobs/{jobId} for the result. Send "Accept: application/json" (without text/event-stream) to instead block and receive the final {success,output|error} synchronously. resp-200-example: {"jobId":"3f9c5b1a-2e4d-4a6f-9b0a-1c7d8e9f0a1b"} resp-403: Permission denied, or access denied to this environment
+@openapi summary: Start a stack (docker compose start/up), asynchronously path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment id (from GET /api/environments) resp-400: Invalid stack name resp-200: {jobId:string!} resp-200-desc: Fire-and-forget job id — poll GET /api/jobs/{jobId} for the result. Send "Accept: application/json" (without text/event-stream) to instead block and receive the final {success,output|error} synchronously. resp-200-example: {"jobId":"3f9c5b1a-2e4d-4a6f-9b0a-1c7d8e9f0a1b"} resp-403: Permission denied, or access denied to this environment
 - Source: `src/routes/api/stacks/[name]/start/+server.ts`
 
 ### `POST` `/stacks/[name]/stop`
-@openapi summary: Stop a stack (docker compose stop), asynchronously path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment id (from GET /api/environments) resp-200: {jobId:string!} resp-200-desc: Fire-and-forget job id — poll GET /api/jobs/{jobId} for the result. Send "Accept: application/json" (without text/event-stream) to instead block and receive the final {success,output|error} synchronously. resp-200-example: {"jobId":"3f9c5b1a-2e4d-4a6f-9b0a-1c7d8e9f0a1b"} resp-403: Permission denied, or access denied to this environment
+@openapi summary: Stop a stack (docker compose stop), asynchronously path: name:string! Stack name (from GET /api/stacks) query: env:integer Environment id (from GET /api/environments) resp-400: Invalid stack name resp-200: {jobId:string!} resp-200-desc: Fire-and-forget job id — poll GET /api/jobs/{jobId} for the result. Send "Accept: application/json" (without text/event-stream) to instead block and receive the final {success,output|error} synchronously. resp-200-example: {"jobId":"3f9c5b1a-2e4d-4a6f-9b0a-1c7d8e9f0a1b"} resp-403: Permission denied, or access denied to this environment
 - Source: `src/routes/api/stacks/[name]/stop/+server.ts`
+
+### `GET, PUT` `/stacks/[name]/tags`
+@openapi summary: Get the tag ids assigned to one stack (by name) path: name:string! Stack name query: env:integer Environment id resp-200: {tagIds:array<integer>!} resp-200-example: {"tagIds":[3]} resp-403: Permission denied (needs stacks:view)
+- Source: `src/routes/api/stacks/[name]/tags/+server.ts`
 
 ### `POST` `/stacks/[name]/validate`
 - Source: `src/routes/api/stacks/[name]/validate/+server.ts`
@@ -931,15 +1000,15 @@ Docker and Compose built-in env vars consumed implicitly at runtime (not via ${}
 - Source: `src/routes/api/stacks/adopt/+server.ts`
 
 ### `GET` `/stacks/base-path`
-GET /api/stacks/base-path @openapi summary: Return the default Dockhand stacks directory ($DATA_DIR/stacks/) where new stacks are stored by default query: env:integer Environment ID used to select the local or environment-scoped stacks root resp-200: {basePath:string!} resp-200-example: {"basePath":"/data/stacks"} Returns the Dockhand stacks root for the requested environment context. Query params: - env: Environment ID (optional) — when set, returns STACKS_DIR for local envs   with STACKS_DIR configured, otherwise $DATA_DIR/stacks (staging / legacy).
+GET /api/stacks/base-path @openapi summary: Return the default Dockhand stacks directory ($DATA_DIR/stacks/) where new stacks are stored by default query: env:integer Environment ID used to select the local or environment-scoped stacks root resp-200: {basePath:string!} resp-200-example: {"basePath":"/data/stacks"} resp-403: Permission denied (needs stacks:view, and access to the environment) Returns the Dockhand stacks root for the requested environment context. Query params: - env: Environment ID (optional) — when set, returns STACKS_DIR for local envs   with STACKS_DIR configured, otherwise $DATA_DIR/stacks (staging / legacy).
 - Source: `src/routes/api/stacks/base-path/+server.ts`
 
 ### `GET` `/stacks/default-path`
-Get the default path for a new stack — used by the UI to show where files will be created. With location set the path is {location}/{envName}/{stackName}/, otherwise Dockhand's default $DATA_DIR/stacks/{envName}/{stackName}/. @openapi summary: Compute the default compose/env file paths for a new stack, either under a custom base location or under Dockhand's default stacks directory query: name:string! Stack name query: env:integer Environment ID (scopes the path under the environment name) (from GET /api/environments) query: location:string Custom base location path resp-200: {stackDir:string!, composePath:string!, envPath:string!, source:string!} resp-200-example: {"stackDir":"/data/stacks/prod/web","composePath":"/data/stacks/prod/web/compose.yaml","envPath":"/data/stacks/prod/web/.env","source":"default"} resp-400: Stack name is required
+Get the default path for a new stack — used by the UI to show where files will be created. With location set the path is {location}/{envName}/{stackName}/, otherwise Dockhand's default $DATA_DIR/stacks/{envName}/{stackName}/. @openapi summary: Compute the default compose/env file paths for a new stack, either under a custom base location or under Dockhand's default stacks directory query: name:string! Stack name query: env:integer Environment ID (scopes the path under the environment name) (from GET /api/environments) query: location:string Custom base location path resp-200: {stackDir:string!, composePath:string!, envPath:string!, source:string!} resp-200-example: {"stackDir":"/data/stacks/prod/web","composePath":"/data/stacks/prod/web/compose.yaml","envPath":"/data/stacks/prod/web/.env","source":"default"} resp-400: Stack name is required resp-403: Permission denied (needs stacks:view, and access to the environment)
 - Source: `src/routes/api/stacks/default-path/+server.ts`
 
 ### `GET` `/stacks/path-hints`
-GET /api/stacks/path-hints?name=stackName&env=envId @openapi summary: Return path hints (working directory and config file paths) extracted from a stack's Docker container labels query: name:string! Stack name (from GET /api/stacks) query: env:integer Environment ID the stack belongs to (from GET /api/environments) resp-200: {stackName:string!, workingDir:string, configFiles:array<string>} resp-200-example: {"stackName":"web","workingDir":"/opt/stacks/web","configFiles":["/opt/stacks/web/compose.yaml"]} resp-400: Stack name is required resp-401: Unauthorized resp-500: Failed to get path hints
+GET /api/stacks/path-hints?name=stackName&env=envId @openapi summary: Return path hints (working directory and config file paths) extracted from a stack's Docker container labels query: name:string! Stack name (from GET /api/stacks) query: env:integer Environment ID the stack belongs to (from GET /api/environments) resp-200: {stackName:string!, workingDir:string, configFiles:array<string>} resp-200-example: {"stackName":"web","workingDir":"/opt/stacks/web","configFiles":["/opt/stacks/web/compose.yaml"]} resp-400: Stack name is required or environment ID is invalid resp-401: Unauthorized resp-403: Permission denied (requires stacks:edit and environment access) resp-500: Failed to get path hints
 - Source: `src/routes/api/stacks/path-hints/+server.ts`
 
 ### `POST` `/stacks/scan`
@@ -969,6 +1038,16 @@ GET /api/stacks/path-hints?name=stackName&env=envId @openapi summary: Return pat
 ### `GET` `/system/files/content`
 GET /api/system/files/content Read file content from Dockhand's local filesystem @openapi summary: Read a text file from Dockhand's local filesystem (max 10MB, protected paths denied) query: path:string! Absolute path of the file to read resp-200: {path:string!, content:string!, size:integer!, mtime:string!} resp-200-example: {"path":"/docker/stacks/myapp/compose.yaml","content":"services:\n  app:\n    image: nginx","size":42,"mtime":"2026-07-01T10:00:00.000Z"} resp-400: Path is missing, points to a directory, or the file exceeds 10MB resp-403: Permission denied, or the path is protected resp-404: File not found resp-500: Failed to read file
 - Source: `src/routes/api/system/files/content/+server.ts`
+
+## tags
+
+### `GET, POST` `/tags`
+@openapi summary: List the global tag catalog (name + colour) resp-200: {tags:array<{id:integer!, name:string!, color:string!}>!} resp-200-example: {"tags":[{"id":3,"name":"auth","color":"green"}]} resp-403: Permission denied (needs containers:view)
+- Source: `src/routes/api/tags/+server.ts`
+
+### `DELETE, PUT` `/tags/[id]`
+@openapi summary: Update a global catalog tag's name and/or colour path: id:integer! Tag id body: {name:string, color:string, icon:string} body-example: {"color":"blue","icon":"cloud"} resp-200: {success:boolean!} resp-400: Invalid tag id or name resp-403: Permission denied (admin only) resp-409: A tag with that name already exists
+- Source: `src/routes/api/tags/[id]/+server.ts`
 
 ## templates
 

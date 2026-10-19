@@ -445,7 +445,13 @@ def test_check_updates_item_tier1_only_no_tier2_at_all():
         },
     )
     item = entity._check_updates_item()
-    assert item == {"hasUpdate": True, "newerVersion": None}
+    assert item == {
+        "hasUpdate": True,
+        "newerVersion": None,
+        "pinnedToDigest": False,
+        "releaseAgeRemainingHours": None,
+        "checkedAt": None,
+    }
 
 
 def test_check_updates_item_tier1_only_semver_suggestion_no_tier2():
@@ -456,7 +462,13 @@ def test_check_updates_item_tier1_only_semver_suggestion_no_tier2():
         },
     )
     item = entity._check_updates_item()
-    assert item == {"hasUpdate": False, "newerVersion": NEWER_VERSION}
+    assert item == {
+        "hasUpdate": False,
+        "newerVersion": NEWER_VERSION,
+        "pinnedToDigest": False,
+        "releaseAgeRemainingHours": None,
+        "checkedAt": None,
+    }
 
 
 def test_check_updates_item_tier2_present_but_no_row_falls_back_to_tier1():
@@ -470,7 +482,13 @@ def test_check_updates_item_tier2_present_but_no_row_falls_back_to_tier1():
         },
     )
     item = entity._check_updates_item()
-    assert item == {"hasUpdate": True, "newerVersion": None}
+    assert item == {
+        "hasUpdate": True,
+        "newerVersion": None,
+        "pinnedToDigest": False,
+        "releaseAgeRemainingHours": None,
+        "checkedAt": None,
+    }
 
 
 def test_check_updates_item_tier2_row_wins_hasupdate_over_tier1():
@@ -849,6 +867,73 @@ async def test_release_notes_newer_tag_notice_survives_changelog_failure():
     assert "also available: **16.4-alpine**" in notes
 
 
+def test_newer_version_attribute_absent_without_suggestion():
+    assert "newer_version" not in _make_entity(ITEM_HAS_UPDATE).extra_state_attributes
+    assert "newer_version" not in _make_entity(ITEM_UP_TO_DATE).extra_state_attributes
+
+
+def test_newer_version_attribute_matches_latest_when_suggestion_only():
+    entity = _make_entity(ITEM_NEWER_VERSION_ONLY)
+    attrs = entity.extra_state_attributes
+    assert attrs["newer_version"] == "16.4-alpine"
+    assert attrs["newer_version"] == entity.latest_version
+
+
+def test_newer_version_bump_and_count_attributes():
+    attrs = _make_entity(ITEM_NEWER_VERSION_ONLY).extra_state_attributes
+    assert attrs["newer_version_bump"] == "minor"
+    assert attrs["newer_versions_count"] == 2
+
+
+def test_newer_version_bump_and_count_tolerate_missing_fields():
+    item = {**ITEM_UP_TO_DATE, "newerVersion": {"tag": "16.4-alpine"}}
+    attrs = _make_entity(item).extra_state_attributes
+    assert "newer_version_bump" not in attrs
+    assert attrs["newer_versions_count"] == 1
+
+
+def test_no_bump_or_count_without_newer_version():
+    attrs = _make_entity(ITEM_HAS_UPDATE).extra_state_attributes
+    assert "newer_version_bump" not in attrs
+    assert "newer_versions_count" not in attrs
+
+
+def test_newer_version_attribute_present_alongside_actionable_update():
+    """The case latest_version can't show: the actionable digest update
+    holds latest_version, and the newer tag is only in the attribute."""
+    entity = _make_entity(ITEM_HAS_UPDATE_AND_NEWER_VERSION)
+    assert entity.latest_version == "79f926e8d8fe"
+    assert entity.extra_state_attributes["newer_version"] == "16.4-alpine"
+
+
+def test_newer_version_attribute_present_alongside_pending_cache():
+    entity = _make_entity(ITEM_NEWER_VERSION_ONLY, pending_ids={CONTAINER_ID})
+    assert entity.latest_version == "update-pending"
+    assert entity.extra_state_attributes["newer_version"] == "16.4-alpine"
+
+
+def test_newer_version_attribute_from_tier1_without_tier2():
+    entity = _make_entity(
+        update_coordinator=None,
+        pending_update_details={
+            CONTAINER_ID: {"hasImageUpdate": True, "newerVersion": NEWER_VERSION}
+        },
+    )
+    assert entity.extra_state_attributes["newer_version"] == "16.4-alpine"
+
+
+def test_newer_version_attribute_absent_when_already_installed():
+    """A floating tag already resolving to the suggested version is not a
+    pending suggestion — the entity is off for it, so no attribute either."""
+    container = {
+        **CONTAINER_NORMAL,
+        "labels": {"org.opencontainers.image.version": "16.4-alpine"},
+    }
+    entity = _make_entity(ITEM_NEWER_VERSION_ONLY, containers=[container])
+    assert entity.installed_version == "16.4-alpine"
+    assert "newer_version" not in entity.extra_state_attributes
+
+
 async def test_pending_cache_takes_precedence_over_newer_version():
     """Divergent-Tier-2 case: Tier 2's row says no digest update, but Tier
     1's pending cache flags one, alongside a newerVersion suggestion.
@@ -1119,6 +1204,36 @@ async def test_async_install_polls_job_until_done():
     entity = _make_entity(ITEM_HAS_UPDATE)
     await _install(entity)
     entity.coordinator.client.async_get_job.assert_called_with("job-1")
+
+
+async def test_async_install_raises_when_dockhand_skips_the_container():
+    """Dockhand 1.0.53+ skips some containers inside a job it still reports
+    as done (e.g. the one it reaches the environment through). Install must
+    not look like it worked, and should still refresh."""
+    entity = _make_entity(ITEM_HAS_UPDATE)
+    message = "Skipping nginx - Dockhand reaches this environment through it"
+    entity.coordinator.client.async_get_job = AsyncMock(
+        return_value={
+            "status": "done",
+            "lines": [
+                {
+                    "data": {
+                        "type": "progress",
+                        "containerId": CONTAINER_ID,
+                        "step": "skipped",
+                        "success": True,
+                        "message": message,
+                    }
+                }
+            ],
+            "result": {"summary": {"total": 1, "success": 0, "skipped": 1}},
+        }
+    )
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await _install(entity)
+    assert exc_info.value.translation_placeholders == {"error": message}
+    entity.coordinator.async_refresh.assert_awaited()
+    assert entity._attr_in_progress is False
 
 
 async def test_async_install_reports_progress_percentage():
@@ -1719,3 +1834,259 @@ def test_pending_updates_total_matches_update_entities_that_are_on():
     assert attrs["pending_updates"] == 2
     assert attrs["pending_system_updates"] == 1
     assert attrs["pending_version_updates"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Install: other containers' lines, a failed step, a job that never ends
+# ---------------------------------------------------------------------------
+
+
+async def test_async_install_ignores_other_containers_lines():
+    """A batch job's log covers every container in it; another container's
+    failure isn't this one's."""
+    entity = _make_entity(ITEM_HAS_UPDATE)
+    entity.coordinator.client.async_get_job = AsyncMock(
+        return_value={
+            "status": "done",
+            "lines": [
+                {"data": {"type": "progress", "step": "failed", "containerId": "x"}},
+                {"data": {"type": "progress", "step": "done", "containerId": None}},
+            ],
+        }
+    )
+    await _install(entity)
+    assert entity._attr_in_progress is False
+
+
+async def test_async_install_raises_when_the_update_step_fails():
+    entity = _make_entity(ITEM_HAS_UPDATE)
+    entity.coordinator.client.async_get_job = AsyncMock(
+        return_value={
+            "status": "running",
+            "lines": [
+                {
+                    "data": {
+                        "type": "progress",
+                        "step": "failed",
+                        "containerId": CONTAINER_ID,
+                        "error": "pull failed",
+                    }
+                }
+            ],
+        }
+    )
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await _install(entity)
+    assert exc_info.value.translation_placeholders["error"] == "pull failed"
+
+
+async def test_async_install_times_out_on_a_job_that_never_finishes():
+    entity = _make_entity(ITEM_HAS_UPDATE)
+    entity.coordinator.client.async_get_job = AsyncMock(
+        return_value={"status": "running", "lines": []}
+    )
+    with (
+        patch("custom_components.dockhand.update._JOB_POLL_MAX_ATTEMPTS", 2),
+        patch("custom_components.dockhand.update.asyncio.sleep", AsyncMock()),
+        pytest.raises(HomeAssistantError) as exc_info,
+    ):
+        await _install(entity)
+    assert "timed out" in exc_info.value.translation_placeholders["error"]
+    assert entity._attr_in_progress is False
+
+
+def test_update_status_is_empty_for_a_container_without_an_id():
+    from custom_components.dockhand.helpers import _container_update_status
+
+    assert _container_update_status({"name": "x"}, {}, None) == {}
+
+
+# ---------------------------------------------------------------------------
+# Pinned digests (Dockhand 1.0.54+) and updates held by the minimum image age
+# ---------------------------------------------------------------------------
+
+
+def _pinned_entity(tier2_item=None):
+    if tier2_item is None:
+        return _make_entity(
+            update_coordinator=None,
+            pending_update_details={
+                CONTAINER_ID: {"hasImageUpdate": False, "pinnedToDigest": True}
+            },
+        )
+    return _make_entity(tier2_item)
+
+
+def test_pinned_digest_turns_the_entity_on_without_install():
+    from homeassistant.components.update import UpdateEntityFeature
+
+    entity = _pinned_entity()
+    entity._update_supported_features()
+    assert entity.latest_version == "update-pending"
+    assert entity.latest_version != entity.installed_version
+    assert UpdateEntityFeature.INSTALL not in entity._attr_supported_features
+    assert entity.extra_state_attributes["pinned_digest_moved"] is True
+
+
+def test_pinned_digest_from_the_precise_check_shows_the_new_digest():
+    entity = _pinned_entity(
+        {
+            **ITEM_UP_TO_DATE,
+            "pinnedToDigest": True,
+            "newDigest": "sha256:aabbccddeeff00",
+        }
+    )
+    assert entity.latest_version == "aabbccddeeff"
+
+
+def test_newer_version_tag_wins_over_a_pinned_digest():
+    entity = _pinned_entity(
+        {**ITEM_UP_TO_DATE, "pinnedToDigest": True, "newerVersion": NEWER_VERSION}
+    )
+    assert entity.latest_version == "16.4-alpine"
+    assert entity.extra_state_attributes["pinned_digest_moved"] is True
+
+
+def _held_entity(hours=12, checked_at=None):
+    return _make_entity(
+        update_coordinator=None,
+        pending_update_details={
+            CONTAINER_ID: {
+                "hasImageUpdate": False,
+                "releaseAgeRemainingHours": hours,
+                "checkedAt": checked_at,
+            }
+        },
+    )
+
+
+def test_held_update_turns_the_entity_on_without_install():
+    from homeassistant.components.update import UpdateEntityFeature
+
+    entity = _held_entity()
+    entity._update_supported_features()
+    assert entity.latest_version == "update-pending"
+    assert UpdateEntityFeature.INSTALL not in entity._attr_supported_features
+    assert entity.extra_state_attributes["update_held_hours"] == 12
+    assert "pinned_digest_moved" not in entity.extra_state_attributes
+
+
+def test_held_update_turns_off_once_dockhand_stops_reporting_it():
+    """Updated or recreated some other way: nothing is held for the
+    container Dockhand now reports, so the entity is off again."""
+    entity = _held_entity()
+    entity.coordinator.data["environments"][ENV_ID]["pending_update_details"] = {}
+    assert entity.latest_version == entity.installed_version
+    assert "update_held_hours" not in entity.extra_state_attributes
+
+
+def test_held_hours_count_down_from_dockhands_check():
+    from datetime import UTC, datetime, timedelta
+
+    from custom_components.dockhand.helpers import _update_held_hours
+
+    checked = datetime(2026, 10, 19, 8, 0, tzinfo=UTC)
+    status = {"releaseAgeRemainingHours": 12, "checkedAt": checked.isoformat()}
+    assert (
+        _update_held_hours(status, now=checked + timedelta(hours=2, minutes=30)) == 10
+    )
+    assert _update_held_hours(status, now=checked + timedelta(hours=20)) == 0
+    assert _update_held_hours({**status, "checkedAt": "not a date"}) == 12
+    assert _update_held_hours({**status, "checkedAt": "2026-13-45T00:00:00"}) == 12
+    assert _update_held_hours({**status, "hasUpdate": True}) is None
+
+
+async def test_release_notes_once_the_wait_is_over():
+    entity = _held_entity(checked_at="2020-01-01T00:00:00+00:00")
+    assert entity.extra_state_attributes["update_held_hours"] == 0
+    assert "reached the minimum image age" in await entity.async_release_notes()
+
+
+def test_up_to_date_entity_has_neither_attribute():
+    attrs = _make_entity(ITEM_UP_TO_DATE).extra_state_attributes
+    assert "pinned_digest_moved" not in attrs
+    assert "update_held_hours" not in attrs
+
+
+async def test_release_notes_explain_a_pinned_digest_and_a_held_update():
+    pinned = await _pinned_entity().async_release_notes()
+    assert "Pinned to a digest" in pinned
+    held = await _make_entity(
+        {**ITEM_UP_TO_DATE, "releaseAgeRemainingHours": 5}
+    ).async_release_notes()
+    assert "5 hour(s) left" in held
+
+
+# ---------------------------------------------------------------------------
+# A system container Dockhand's containers list doesn't flag
+# ---------------------------------------------------------------------------
+
+# Docker lists the image by id, so the containers list can't classify it;
+# check-updates, which uses the configured image, can.
+CONTAINER_DOCKHAND_BY_ID = {
+    **CONTAINER_NORMAL,
+    "image": "sha256:53fdaafc3ea1d8e3ae755cb63b4c1c99e3a860b4a1031451e76ea3f8e2027b42",
+    "systemContainer": None,
+}
+ITEM_DOCKHAND_UPDATE = {
+    **ITEM_HAS_UPDATE,
+    "imageName": "docker.io/fnsys/dockhand:latest",
+    "systemContainer": "dockhand",
+}
+
+
+async def test_system_container_found_by_the_precise_check_offers_no_install():
+    from homeassistant.components.update import UpdateEntityFeature
+
+    entity = _make_entity(
+        update_item=ITEM_DOCKHAND_UPDATE, containers=[CONTAINER_DOCKHAND_BY_ID]
+    )
+    assert entity.latest_version != entity.installed_version
+    assert UpdateEntityFeature.INSTALL not in entity._attr_supported_features
+    notes = await entity.async_release_notes()
+    assert notes is not None
+    assert "system container" in notes.lower()
+
+
+def test_system_container_found_by_a_check_button_press_offers_no_install():
+    """Without the precise check, a check-updates result reaches the entity
+    through pending_update_details instead."""
+    from homeassistant.components.update import UpdateEntityFeature
+
+    from custom_components.dockhand.coordinator import _pending_detail
+
+    entity = _make_entity(
+        containers=[CONTAINER_DOCKHAND_BY_ID],
+        pending_ids={CONTAINER_ID},
+        pending_update_details={
+            CONTAINER_ID: _pending_detail(True, ITEM_DOCKHAND_UPDATE)
+        },
+        update_coordinator=None,
+    )
+    assert entity.latest_version != entity.installed_version
+    assert UpdateEntityFeature.INSTALL not in entity._attr_supported_features
+
+
+def test_system_container_found_by_a_check_is_not_bulk_updated():
+    from custom_components.dockhand.sensor import DockhandEnvContainerCountSensor
+
+    fast = _make_fast_coord(
+        containers=[CONTAINER_DOCKHAND_BY_ID], pending_ids={CONTAINER_ID}
+    )
+    sensor = DockhandEnvContainerCountSensor(
+        fast,
+        _make_update_coord(ITEM_DOCKHAND_UPDATE),
+        ENTRY_ID,
+        ENV_ID,
+        ENV_NAME,
+        "http://dockhand",
+    )
+    attrs = sensor.extra_state_attributes
+    assert attrs["pending_updates"] == 0
+    assert attrs["pending_system_updates"] == 1
+    assert attrs["pending_updates_total"] == 1
+
+
+def test_no_container_is_not_a_system_container():
+    entity = _make_entity(containers=[])
+    assert entity._is_system() is False

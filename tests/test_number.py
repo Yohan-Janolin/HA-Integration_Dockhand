@@ -421,3 +421,46 @@ def test_unique_id_format():
         entity._attr_unique_id
         == f"{ENTRY_ID}_{ENV_ID}_container_{CONTAINER_NAME}_memory_limit"
     )
+
+
+def test_unavailable_once_the_container_is_gone():
+    entity = _make_memory_entity({CONTAINER_NAME: {"memory": 0}}, containers=[])
+    assert entity.available is False
+
+
+async def test_a_second_decrease_replaces_the_pending_safety_check():
+    entity = _make_memory_entity({CONTAINER_NAME: {"memory": 536870912}})
+    first_cancel = MagicMock()
+    entity._cancel_safety_check = first_cancel
+    with (
+        patch.object(entity, "async_write_ha_state"),
+        patch("custom_components.dockhand.number.async_call_later"),
+    ):
+        await entity.async_set_native_value(268435456)
+    first_cancel.assert_called_once()
+
+
+async def test_memory_safety_check_survives_a_failed_revert():
+    """The revert is best effort: a failure is logged, and the entity still
+    shows the previous value Dockhand is expected to settle back on."""
+    entity = _make_memory_entity({CONTAINER_NAME: {"memory": 536870912}})
+    entity._container = MagicMock(
+        return_value={**CONTAINER_STANDALONE, "state": "exited"}
+    )
+    entity._fast_coordinator.client.async_update_container_runtime = AsyncMock(
+        side_effect=Exception("unreachable")
+    )
+    check_fn = entity._async_check_and_revert(536870912)
+    with patch.object(entity, "async_write_ha_state"):
+        await check_fn(None)
+    assert entity._optimistic_value == 536870912
+
+
+def test_cpu_and_pids_values():
+    cpu = _make_cpu_entity({CONTAINER_NAME: {}})
+    assert cpu.native_value is None  # nothing reported yet
+    cpu._optimistic_value = 1.5
+    assert cpu.native_value == 1.5
+    pids = _make_pids_entity({CONTAINER_NAME: {"pids_limit": 100}})
+    pids._optimistic_value = 200
+    assert pids.native_value == 200

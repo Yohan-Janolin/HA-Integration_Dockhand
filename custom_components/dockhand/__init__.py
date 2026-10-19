@@ -1,8 +1,9 @@
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
@@ -11,25 +12,30 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import DockhandClient
 from .const import (
-    _LEGACY_CONF_ENABLE_UPDATES,
     _LEGACY_CONF_PASSWORD,
     _LEGACY_CONF_SESSION_COOKIE,
     _LEGACY_CONF_USERNAME,
     CONF_API_TOKEN,
     CONF_API_URL,
-    CONF_ENABLE_CONTAINER_STATS,
     CONF_ENABLE_IMAGES,
     CONF_ENABLE_NETWORKS,
     CONF_ENABLE_PRECISE_UPDATES,
+    CONF_ENABLE_RESOURCE_STATS,
     CONF_ENABLE_RUNTIME_CONTROLS,
     CONF_ENABLE_SCHEDULES,
     CONF_ENABLE_UPDATE_ENTITIES,
     CONF_ENABLE_VOLUMES,
     CONF_VERIFY_SSL,
-    DEFAULT_ENABLE_CONTAINER_STATS,
+    DEFAULT_ENABLE_RESOURCE_STATS,
     DEFAULT_ENABLE_UPDATE_ENTITIES,
     DOMAIN,
+    OPTION_KEYS,
     PLATFORMS,
+    SCHEMA,
+    SCHEMA_MINOR_VERSION,
+    SCHEMA_VERSION,
+    renames_to_mirror,
+    renames_to_translate,
 )
 from .coordinator import (
     DockhandFastCoordinator,
@@ -38,13 +44,16 @@ from .coordinator import (
 )
 from .helpers import (
     CONTAINER_STATS_SUFFIXES,
+    STACK_STATS_SUFFIXES,
+    _actionable_pending_update_container_ids,
     _all_envs,
     _compose_project,
     _container_has_healthcheck,
-    _container_has_pending_update,
     _coordinator_env,
     _device_id_container,
+    _device_id_env,
     _device_id_schedule,
+    _device_id_schedules_hub,
     _device_id_stack,
     _ensure_env_devices,
     _ensure_hub_devices,
@@ -136,46 +145,113 @@ class DockhandData:
 type DockhandConfigEntry = ConfigEntry[DockhandData]
 
 
-async def async_migrate_entry(hass: HomeAssistant, entry: DockhandConfigEntry) -> bool:
-    """Migrate a config entry to the current version.
+def _normalized_entry_config(
+    data: Mapping[str, Any],
+    options: Mapping[str, Any],
+    schema: tuple[int, int] = SCHEMA,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return (data, options) with every setting under its current name, in
+    entry.options where the Configure dialog keeps it, and also under any
+    old name a release on the previous schema version still reads.
 
-    Version 1 -> 2 (1.8.0): CONF_ENABLE_UPDATES ("enable_updates") was
-    renamed to CONF_ENABLE_PRECISE_UPDATES ("enable_precise_updates") —
-    the old name was misleading once update entities became always-on
-    (Tier 1): this option only ever controlled Tier 2 (precise digest
-    versions via real registry queries), even before the rename. Carries
-    over an existing user's stored value under the old key, if present,
-    rather than silently reverting them to the default.
+    In order:
+      1. Old option names still translated (renames_to_translate) become
+         current ones. An old name wins over a current one: after a
+         downgrade, the older release writes only the old name, so a
+         difference means it changed there.
+      2. Settings stored in entry.data by releases before 1.7.1, whose setup
+         form saved them with the connection details, move to entry.options.
+         A value already in options wins, as it always has for every read.
+      3. Each old name still mirrored (renames_to_mirror: renames made at
+         this schema version) gets the current value again, so a downgrade
+         to a release on the previous schema version keeps the setting.
+         Once a rename stops being mirrored (the next schema bump), step 1
+         removes its leftover copy and nothing writes it back.
 
-    (A 2 -> 3 step briefly existed in an unreleased 1.8.1 dev cycle,
-    grouping enable_precise_updates/poll_interval_updates into a
-    section() alongside the new enable_update_entities — reverted before
-    release after the section's field labels wouldn't render correctly
-    in a live instance and the exact cause couldn't be pinned down. See
-    docs/BACKLOG.md. Nothing ever shipped at version 3, so there's
-    nothing to migrate away from; VERSION is back to 2.)
+    Pure and idempotent — an already-normalized entry comes back unchanged.
+    Run on every setup, not only from async_migrate_entry: after a
+    downgrade and re-upgrade the entry's version is already current, so no
+    migration step runs, and this is what picks up changes made meanwhile.
     """
-    if entry.version == 1:
-        new_options = dict(entry.options)
-        if _LEGACY_CONF_ENABLE_UPDATES in new_options:
-            new_options[CONF_ENABLE_PRECISE_UPDATES] = new_options.pop(
-                _LEGACY_CONF_ENABLE_UPDATES
-            )
-        # Belt-and-suspenders: this option has only ever been set via the
-        # options flow (entry.options) in every released version, never
-        # entry.data — but check data too in case that ever changes.
-        new_data = dict(entry.data)
-        if _LEGACY_CONF_ENABLE_UPDATES in new_data:
-            new_data[CONF_ENABLE_PRECISE_UPDATES] = new_data.pop(
-                _LEGACY_CONF_ENABLE_UPDATES
-            )
+    translate = renames_to_translate(schema)
+    new_data = dict(data)
+    new_options = dict(options)
+    for old, current in translate.items():
+        if old in new_options:
+            new_options[current] = new_options.pop(old)
+    for key in list(new_data):
+        current = translate.get(key, key)
+        if current in OPTION_KEYS:
+            new_options.setdefault(current, new_data.pop(key))
+    for old, current in renames_to_mirror(schema).items():
+        if current in new_options:
+            new_options[old] = new_options[current]
+    return new_data, new_options
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: DockhandConfigEntry) -> bool:
+    """Bring a config entry up to the current schema version.
+
+    All of it is _normalized_entry_config(): renames (RENAMED_OPTIONS in
+    const.py) and moving settings out of entry.data.
+
+    - An entry from the previous schema major or later (back to 1.8.0's
+      version 2 today) is migrated.
+    - An entry more than one schema major old is refused: its renames are
+      no longer kept, so migrating it would silently drop settings. Home
+      Assistant then shows the integration as failed to set up, and it has
+      to be removed and added again.
+    - An entry exactly one minor version NEWER than this code (written by
+      the next schema version's release, then downgraded to this one) is
+      accepted unchanged. Home Assistant only calls this for it because the
+      minor versions differ; settings that release renamed are still
+      readable here because it keeps the old names up to date too
+      (renames_to_mirror).
+    - An entry two or more minor versions newer is refused: the release that
+      wrote it no longer keeps the old names this code reads, so loading it
+      would silently put those settings back to their defaults. Upgrading
+      again, or removing and re-adding the integration, fixes it. A newer
+      MAJOR version is refused by Home Assistant itself, before this runs.
+    """
+    if entry.version < SCHEMA_VERSION - 1:
+        _LOGGER.error(
+            "Dockhand: config entry %s is at schema version %s, too old to "
+            "migrate to %s.%s — remove the integration and add it again",
+            entry.entry_id,
+            entry.version,
+            SCHEMA_VERSION,
+            SCHEMA_MINOR_VERSION,
+        )
+        return False
+    if (
+        entry.version == SCHEMA_VERSION
+        and entry.minor_version > SCHEMA_MINOR_VERSION + 1
+    ):
+        _LOGGER.error(
+            "Dockhand: config entry %s was saved by a newer release (schema "
+            "version %s.%s); this release can only load entries up to %s.%s — "
+            "upgrade the integration again, or remove it and add it again",
+            entry.entry_id,
+            entry.version,
+            entry.minor_version,
+            SCHEMA_VERSION,
+            SCHEMA_MINOR_VERSION + 1,
+        )
+        return False
+    if (entry.version, entry.minor_version) < (SCHEMA_VERSION, SCHEMA_MINOR_VERSION):
+        data, options = _normalized_entry_config(entry.data, entry.options)
         hass.config_entries.async_update_entry(
-            entry, data=new_data, options=new_options, version=2
+            entry,
+            data=data,
+            options=options,
+            version=SCHEMA_VERSION,
+            minor_version=SCHEMA_MINOR_VERSION,
         )
         _LOGGER.info(
-            "Dockhand: migrated config entry %s from version 1 to 2 "
-            "(enable_updates -> enable_precise_updates)",
+            "Dockhand: migrated config entry %s to schema version %s.%s",
             entry.entry_id,
+            SCHEMA_VERSION,
+            SCHEMA_MINOR_VERSION,
         )
     return True
 
@@ -213,7 +289,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: DockhandConfigEntry) -> 
                 "an API token (Profile → API tokens in Dockhand)."
             )
 
-    config = {**entry.data, **entry.options}
+    data, options = _normalized_entry_config(entry.data, entry.options)
+    if data != entry.data or options != entry.options:
+        # Before the update listener is registered, so this doesn't reload.
+        hass.config_entries.async_update_entry(entry, data=data, options=options)
+    config = dict(entry.options)
 
     fast_coordinator = DockhandFastCoordinator(hass, client, config, entry=entry)
     slow_coordinator = DockhandSlowCoordinator(
@@ -499,7 +579,13 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
         container_stats_uids     set[str]   — live entity unique_ids (the 8
                                               container CPU/memory/network/
                                               block-I/O sensors, only while
-                                              "Enable container stats" is on)
+                                              "Enable container and stack stats" is on)
+        stack_stats_uids         set[str]   — live entity unique_ids (Dockhand's
+                                              own stack totals, while the
+                                              container stats option is on
+                                              and Dockhand has the endpoint)
+        stack_stats_fetch_ok_env_ids set[int] — envs whose stack stats
+                                              fetch didn't fail this poll
         git_stack_uids           set[str]   — live entity unique_ids (git stack
                                               sensors/binary_sensor/buttons/switch)
         container_action_uids    set[str]   — live entity unique_ids (running
@@ -526,12 +612,12 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
     slow = entry.runtime_data.slow_coordinator
     slow_data = slow.data or {}
 
-    entry_config = {**entry.data, **entry.options}
+    entry_config = entry.options
     runtime_controls_enabled = bool(
         entry_config.get(CONF_ENABLE_RUNTIME_CONTROLS, False)
     )
     container_stats_enabled = bool(
-        entry_config.get(CONF_ENABLE_CONTAINER_STATS, DEFAULT_ENABLE_CONTAINER_STATS)
+        entry_config.get(CONF_ENABLE_RESOURCE_STATS, DEFAULT_ENABLE_RESOURCE_STATS)
     )
     # Raw config flags, poll-independent — used only for the "feature is off
     # entirely, remove the group device unconditionally" cleanup case. Do not
@@ -559,6 +645,8 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
     # relying purely on device-removal cascade.
     runtime_control_uids: set[str] = set()
     container_stats_uids: set[str] = set()
+    # Dockhand's own stack totals — same option, Dockhand 1.0.52+.
+    stack_stats_uids: set[str] = set()
     # Tier 1 update entities — live whenever CONF_ENABLE_UPDATE_ENTITIES is
     # on (default True) and the environment has updateCheckEnabled=True.
     # Entirely fast-data-derived; Tier 2/update coordinator is purely
@@ -630,6 +718,10 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
     # stacks_fetch_ok_env_ids and `stacks`/every stack-derived uid set.
     containers_fetch_ok_env_ids: set[int] = set()
     stacks_fetch_ok_env_ids: set[int] = set()
+    # Envs whose stack stats weren't a fetch failure this poll — including
+    # ones with the option off or a Dockhand without the endpoint, where
+    # there genuinely are none.
+    stack_stats_fetch_ok_env_ids: set[int] = set()
 
     for env_id, env_data in fast_data.items():
         has_freestanding = False
@@ -638,12 +730,8 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
         env_failures: set[str] = env_data.get("fetch_failures") or set()
         env_containers = env_data.get("containers") or []
         pending_updates = env_data.get("pending_update_container_ids") or set()
-        system_ids = {
-            c.get("id")
-            for c in env_containers
-            if c.get("systemContainer") and c.get("id")
-        }
         update_env_data = update_data.get(env_id)
+        pending_details = env_data.get("pending_update_details") or {}
         if "containers" not in env_failures:
             # Cross-validate: stats.containers.total > 0 but list empty (HTTP
             # 200, no exception) is the fingerprint of the Hawser-online /
@@ -668,10 +756,8 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
                     env_id,
                     stats_containers_total,
                 )
-            if update_entities_enabled and any(
-                _container_has_pending_update(c, pending_updates, update_env_data)
-                for c in env_containers
-                if c.get("id") not in system_ids
+            if update_entities_enabled and _actionable_pending_update_container_ids(
+                env_containers, pending_updates, update_env_data, pending_details
             ):
                 bulk_update_uids.add(f"{entry.entry_id}_{env_id}_bulk_update")
             for c in env_containers:
@@ -708,6 +794,9 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
                             )
             if has_freestanding:
                 containers_group_env_ids.add(env_id)
+        if "stack_stats" not in env_failures:
+            stack_stats_fetch_ok_env_ids.add(env_id)
+        stack_stats_supported = env_data.get("stack_stats") is not None
         if "stacks" not in env_failures:
             stacks_fetch_ok_env_ids.add(env_id)
             for s in env_data.get("stacks") or []:
@@ -728,6 +817,11 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
                     stack_updates_available_uids.add(
                         f"{entry.entry_id}_{env_id}_stack_{stack_name}_updates_available"
                     )
+                if container_stats_enabled and stack_stats_supported:
+                    for suffix in STACK_STATS_SUFFIXES:
+                        stack_stats_uids.add(
+                            f"{entry.entry_id}_{env_id}_stack_{stack_name}{suffix}"
+                        )
 
     # Environments that are offline have unreachable Docker daemons — their
     # container and stack lists will be empty but that is not ground truth.
@@ -802,7 +896,7 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
                         schedule_env_group_ids.add(sched_env_id)
 
         for env_id, env_data in slow_env_map.items():
-            env_failures: set[str] = env_data.get("fetch_failures") or set()
+            env_failures = env_data.get("fetch_failures") or set()
 
             if "images" not in env_failures:
                 images_fetch_ok_env_ids.add(env_id)
@@ -869,6 +963,8 @@ def _build_live_sets(entry: DockhandConfigEntry) -> dict[str, Any]:
         "bulk_update_uids": bulk_update_uids,
         "runtime_control_uids": runtime_control_uids,
         "container_stats_uids": container_stats_uids,
+        "stack_stats_uids": stack_stats_uids,
+        "stack_stats_fetch_ok_env_ids": stack_stats_fetch_ok_env_ids,
         "container_action_uids": container_action_uids,
         "health_uids": health_uids,
         "stack_action_uids": stack_action_uids,
@@ -914,7 +1010,7 @@ def _cleanup_stale_registry(
       update actually resolved) — see bulk_update_uids below.
     - Container stats entity cleanup (the 8 CPU/memory/network/block-I/O
       sensors) uses the same two-case logic, same fast-data reliability —
-      turning "Enable container stats" off removes any already created
+      turning "Enable container and stack stats" off removes any already created
       while it was on, the same way enable_images/enable_volumes/
       enable_networks toggles already worked. The "memory_limit" suffix
       is an intentional exact collision with a runtime control entity of
@@ -1296,7 +1392,7 @@ def _cleanup_stale_registry(
 
         elif uid_type == "container" and uid.endswith(CONTAINER_STATS_SUFFIXES):
             # Container CPU/memory/network/block-I/O sensors — only
-            # created at all when "Enable container stats" is on (see
+            # created at all when "Enable container and stack stats" is on (see
             # sensor.py's async_setup_entry), so — like runtime controls
             # above — need explicit tracking: turning the option off must
             # clean these up even though the container device itself
@@ -1378,6 +1474,20 @@ def _cleanup_stale_registry(
                 _LOGGER.debug("Dockhand: removing stale git stack entity %s", uid)
                 ent_registry.async_remove(entity_entry.entity_id)
 
+        elif uid_type == "stack" and uid.endswith(CONTAINER_STATS_SUFFIXES):
+            # Dockhand's stack totals — removed when the container stats
+            # option is off or Dockhand no longer has the endpoint, but
+            # never because of a failed stack stats fetch.
+            env_id = uid_env_id
+            if env_id not in live["env_ids"] or (
+                env_id in live["online_env_ids"]
+                and env_id in live["stacks_fetch_ok_env_ids"]
+                and env_id in live["stack_stats_fetch_ok_env_ids"]
+                and uid not in live["stack_stats_uids"]
+            ):
+                _LOGGER.debug("Dockhand: removing stale stack stats entity %s", uid)
+                ent_registry.async_remove(entity_entry.entity_id)
+
         elif uid_type == "stack" and any(
             uid.endswith(f"_{suffix}") for suffix in _STACK_ACTION_SUFFIXES
         ):
@@ -1432,6 +1542,46 @@ def _cleanup_stale_registry(
             ):
                 _LOGGER.debug("Dockhand: removing stale stack deploy entity %s", uid)
                 ent_registry.async_remove(entity_entry.entity_id)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: DockhandConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """Whether the user may delete this device from the device page.
+
+    Cleanup (_cleanup_stale_registry) removes devices Dockhand stops
+    reporting, but deliberately keeps any it can't confirm are gone — an
+    offline environment's, or one whose fetch failed this cycle. This is
+    how the user removes one of those by hand. A device Dockhand still
+    reports is refused, since the next poll would only recreate it. Group
+    devices (Containers, Stacks, …) of a live environment are refused too:
+    cleanup already removes them once they're empty.
+    """
+    if entry.state is not ConfigEntryState.LOADED:
+        return True
+    live_sets = _build_live_sets(entry)
+    env_ids: set[int] = live_sets["env_ids"]
+    env_prefixes = tuple(_device_id_env(entry.entry_id, env_id) for env_id in env_ids)
+    live: set[str] = {
+        *live_sets["containers"],
+        *live_sets["stacks"],
+        *live_sets["schedules"],
+    }
+    if live_sets["schedules_feature_enabled"]:
+        live.add(_device_id_schedules_hub(entry.entry_id))
+    for domain, identifier in device_entry.identifiers:
+        if domain != DOMAIN:
+            continue
+        if identifier in live:
+            return False
+        # The environment device itself, or one of its group devices
+        # ("<env device id>_Containers" and so on).
+        if any(
+            identifier == prefix or identifier.startswith(f"{prefix}_")
+            for prefix in env_prefixes
+        ):
+            return False
+    return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: DockhandConfigEntry) -> bool:

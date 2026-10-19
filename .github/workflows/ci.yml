@@ -64,5 +64,27 @@ jobs:
           python-version: "3.14"
       - name: Install test dependencies
         run: pip install -r requirements_test.txt
-      - name: Run test suite
-        run: pytest tests/ -v --tb=short
+      - name: Strict typing (mypy, Home Assistant core settings)
+        run: mypy
+      - name: Run test suite (100% line coverage)
+        run: >
+          pytest tests/ -v --tb=short
+          --cov=custom_components/dockhand --cov-report=term-missing:skip-covered
+          --cov-fail-under=100
+
+  # ── Quality scale rules vs Home Assistant core ──────────────────────────
+  # hassfest only checks quality_scale.yaml for core integrations; this
+  # fails when Home Assistant adds or retires a rule our file doesn't cover.
+  # See docs/QUALITY_SCALE.md.
+  quality-scale:
+    name: Quality scale rules
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Compare quality_scale.yaml with Home Assistant's rule list
+        run: python3 scripts/check_quality_scale.py

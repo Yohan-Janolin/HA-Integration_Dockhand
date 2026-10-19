@@ -382,3 +382,65 @@ def test_container_auto_update_disabled_by_default():
         fast, slow, client, ENTRY_ID, ENV_ID, ENV_NAME, BASE_URL, "web"
     )
     assert not switch._attr_entity_registry_enabled_default
+
+
+# ---------------------------------------------------------------------------
+# Auto update switches: errors, refreshes and availability
+# ---------------------------------------------------------------------------
+
+
+def _container_auto_update_switch(containers=None, client=None):
+    fast = _make_fast_coord(
+        containers=containers
+        if containers is not None
+        else [{"name": "web", "id": "a"}]
+    )
+    slow = _make_slow_coord()
+    slow.data["environments"][ENV_ID]["auto_update_settings"] = {}
+    return DockhandContainerAutoUpdateSwitch(
+        fast, slow, client or MagicMock(), ENTRY_ID, ENV_ID, ENV_NAME, BASE_URL, "web"
+    )
+
+
+def test_container_auto_update_unavailable_once_the_container_is_gone():
+    assert _container_auto_update_switch(containers=[]).available is False
+
+
+async def test_container_auto_update_api_error_is_action_failed():
+    client = MagicMock()
+    client.async_set_container_auto_update = AsyncMock(side_effect=Exception("500"))
+    switch = _container_auto_update_switch(client=client)
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await switch.async_turn_on()
+    assert exc_info.value.translation_key == "action_failed"
+
+
+def test_container_auto_update_refresh_drops_the_optimistic_value():
+    switch = _container_auto_update_switch()
+    switch._optimistic_value = True
+    with patch.object(switch, "async_write_ha_state"):
+        switch._handle_coordinator_update()
+    assert switch.is_on is False
+
+
+async def test_git_stack_auto_update_api_error_is_action_failed():
+    client = MagicMock()
+    client.async_update_git_stack = AsyncMock(side_effect=Exception("500"))
+    switch = DockhandGitStackAutoUpdateSwitch(
+        _make_slow_coord(), client, ENTRY_ID, ENV_ID, ENV_NAME, BASE_URL, GIT_STACK
+    )
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await switch.async_turn_off()
+    assert exc_info.value.translation_key == "action_failed"
+
+
+async def test_git_stack_auto_update_turn_off_sends_put():
+    client = MagicMock()
+    client.async_update_git_stack = AsyncMock(return_value={"success": True})
+    switch = DockhandGitStackAutoUpdateSwitch(
+        _make_slow_coord(), client, ENTRY_ID, ENV_ID, ENV_NAME, BASE_URL, GIT_STACK
+    )
+    with patch.object(switch, "async_write_ha_state"):
+        await switch.async_turn_off()
+    client.async_update_git_stack.assert_called_once_with(42, {"autoUpdate": False})
+    assert switch.is_on is False

@@ -1,9 +1,9 @@
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, override
 
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     TextSelector,
@@ -11,40 +11,54 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+from . import DockhandConfigEntry
 from .api import DockhandAuthError, DockhandClient
 from .const import (
     CONF_API_TOKEN,
     CONF_API_URL,
-    CONF_ENABLE_CONTAINER_STATS,
     CONF_ENABLE_IMAGES,
     CONF_ENABLE_NETWORKS,
     CONF_ENABLE_PRECISE_UPDATES,
+    CONF_ENABLE_RESOURCE_STATS,
     CONF_ENABLE_RUNTIME_CONTROLS,
     CONF_ENABLE_SCHEDULES,
     CONF_ENABLE_UPDATE_ENTITIES,
     CONF_ENABLE_VOLUMES,
-    CONF_POLL_INTERVAL,
+    CONF_POLL_INTERVAL_FAST,
+    CONF_POLL_INTERVAL_PRECISE_UPDATES,
     CONF_POLL_INTERVAL_SLOW,
-    CONF_POLL_INTERVAL_UPDATES,
     CONF_VERIFY_SSL,
-    DEFAULT_ENABLE_CONTAINER_STATS,
     DEFAULT_ENABLE_IMAGES,
     DEFAULT_ENABLE_NETWORKS,
     DEFAULT_ENABLE_PRECISE_UPDATES,
+    DEFAULT_ENABLE_RESOURCE_STATS,
     DEFAULT_ENABLE_RUNTIME_CONTROLS,
     DEFAULT_ENABLE_SCHEDULES,
     DEFAULT_ENABLE_UPDATE_ENTITIES,
     DEFAULT_ENABLE_VOLUMES,
-    DEFAULT_POLL_INTERVAL,
+    DEFAULT_POLL_INTERVAL_FAST,
+    DEFAULT_POLL_INTERVAL_PRECISE_UPDATES,
     DEFAULT_POLL_INTERVAL_SLOW,
-    DEFAULT_POLL_INTERVAL_UPDATES,
     DOMAIN,
-    MIN_POLL_INTERVAL,
+    MIN_POLL_INTERVAL_FAST,
+    MIN_POLL_INTERVAL_PRECISE_UPDATES,
     MIN_POLL_INTERVAL_SLOW,
-    MIN_POLL_INTERVAL_UPDATES,
+    SCHEMA_MINOR_VERSION,
+    SCHEMA_VERSION,
 )
 
 DEFAULT_VERIFY_SSL = True
+
+
+def _form(schema: vol.Schema) -> Any:
+    """A form schema in whatever type this Home Assistant's forms take.
+
+    From 2026.10 Home Assistant validates forms with probatio and makes
+    `import voluptuous` load probatio, so at runtime these schemas already
+    are probatio schemas; only the static types differ. Voluptuous stays
+    while the minimum Home Assistant version predates probatio.
+    """
+    return schema
 
 
 def _connection_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
@@ -60,7 +74,7 @@ def _connection_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
     )
 
 
-def _reconfigure_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
+def _reconfigure_schema(defaults: Mapping[str, Any] | None = None) -> vol.Schema:
     """Reconfigure step: URL, SSL, and token.
 
     The token field is pre-populated (masked) with the existing token so the
@@ -97,9 +111,9 @@ def _options_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
     return vol.Schema(
         {
             vol.Optional(
-                CONF_POLL_INTERVAL,
-                default=d.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
-            ): vol.All(vol.Coerce(int), vol.Range(min=MIN_POLL_INTERVAL)),
+                CONF_POLL_INTERVAL_FAST,
+                default=d.get(CONF_POLL_INTERVAL_FAST, DEFAULT_POLL_INTERVAL_FAST),
+            ): vol.All(vol.Coerce(int), vol.Range(min=MIN_POLL_INTERVAL_FAST)),
             vol.Optional(
                 CONF_POLL_INTERVAL_SLOW,
                 default=d.get(CONF_POLL_INTERVAL_SLOW, DEFAULT_POLL_INTERVAL_SLOW),
@@ -121,16 +135,17 @@ def _options_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 default=d.get(CONF_ENABLE_NETWORKS, DEFAULT_ENABLE_NETWORKS),
             ): bool,
             vol.Optional(
-                CONF_ENABLE_CONTAINER_STATS,
+                CONF_ENABLE_RESOURCE_STATS,
                 default=d.get(
-                    CONF_ENABLE_CONTAINER_STATS, DEFAULT_ENABLE_CONTAINER_STATS
+                    CONF_ENABLE_RESOURCE_STATS, DEFAULT_ENABLE_RESOURCE_STATS
                 ),
             ): bool,
-            # Placed directly above enable_precise_updates and poll_interval_updates,
-            # which are both refinements of this one — they have no effect at all
-            # when this is off. Was briefly grouped via a HA section() (config
-            # entry VERSION 3) to make that relationship visually obvious, but
-            # reverted (see docs/BACKLOG.md "Group update options via section()")
+            # Placed directly above enable_precise_updates and
+            # poll_interval_precise_updates, which are both refinements of this
+            # one — they have no effect at all when this is off. Was briefly
+            # grouped via a HA section() (in an unreleased 1.8.1 dev build) to
+            # make that relationship obvious, but reverted (see docs/BACKLOG.md
+            # "Group update options via section()")
             # after two different translation-structure attempts both failed to
             # render field labels/help text correctly in a live instance and the
             # actual cause couldn't be confirmed — not worth the schema-version
@@ -149,11 +164,14 @@ def _options_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 ),
             ): bool,
             vol.Optional(
-                CONF_POLL_INTERVAL_UPDATES,
+                CONF_POLL_INTERVAL_PRECISE_UPDATES,
                 default=d.get(
-                    CONF_POLL_INTERVAL_UPDATES, DEFAULT_POLL_INTERVAL_UPDATES
+                    CONF_POLL_INTERVAL_PRECISE_UPDATES,
+                    DEFAULT_POLL_INTERVAL_PRECISE_UPDATES,
                 ),
-            ): vol.All(vol.Coerce(int), vol.Range(min=MIN_POLL_INTERVAL_UPDATES)),
+            ): vol.All(
+                vol.Coerce(int), vol.Range(min=MIN_POLL_INTERVAL_PRECISE_UPDATES)
+            ),
             # Deliberately last: a genuinely advanced setting (exposes
             # write-capable number/select entities that change a
             # container's actual runtime config), unlike everything above
@@ -170,21 +188,24 @@ def _options_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
 
 
 class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    VERSION = 2
+    # Set in const.py, where the rename rules that depend on them live.
+    VERSION = SCHEMA_VERSION
+    MINOR_VERSION = SCHEMA_MINOR_VERSION
 
     def __init__(self) -> None:
         # Accumulates data across multi-step flows.
         self._connection_data: dict[str, Any] = {}
         # Stores confirmed connection data while the setup_options step runs.
         self._confirmed_data: dict[str, Any] = {}
-        # Tracks which flow triggered the token step.
-        # Values: "user" | "reauth" | "reconfigure"
+        # Tracks which flow triggered the token step: "user" or "reconfigure".
+        # (Re-authentication has its own token form, reauth_confirm.)
         self._flow_origin: str = "user"
 
     @staticmethod
     @callback
+    @override
     def async_get_options_flow(
-        config_entry: config_entries.ConfigEntry,
+        config_entry: DockhandConfigEntry,
     ) -> DockhandOptionsFlow:
         """Return the options flow handler."""
         return DockhandOptionsFlow(config_entry)
@@ -193,9 +214,10 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # Step 1: connection settings (URL + SSL only)
     # ------------------------------------------------------------------ #
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """First step: URL and settings. Probe server to detect auth requirement."""
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -230,7 +252,7 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=_connection_schema(user_input or {}),
+            data_schema=_form(_connection_schema(user_input or {})),
             errors=errors,
         )
 
@@ -240,7 +262,7 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_token(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """Token step — shown only when the server requires authentication."""
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -256,22 +278,12 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._confirmed_data = merged
                     return await self.async_step_setup_options()
 
-                # reauth and reconfigure — update the existing entry
-                entry = self.hass.config_entries.async_get_entry(
-                    self.context["entry_id"]
+                # Reconfigure, the only other way here: update its entry.
+                # __init__.py's update listener reloads it.
+                self.hass.config_entries.async_update_entry(
+                    self._get_reconfigure_entry(), data=merged
                 )
-                if entry:
-                    # async_update_entry() alone is enough now — __init__.py
-                    # registers an update listener that reloads the entry
-                    # whenever data/options change, so an explicit reload
-                    # here would just be a redundant second one.
-                    self.hass.config_entries.async_update_entry(entry, data=merged)
-                reason = (
-                    "reauth_successful"
-                    if self._flow_origin == "reauth"
-                    else "reconfigure_successful"
-                )
-                return self.async_abort(reason=reason)
+                return self.async_abort(reason="reconfigure_successful")
 
             except DockhandAuthError:
                 errors["base"] = "invalid_auth"
@@ -280,7 +292,7 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="token",
-            data_schema=_token_schema(),
+            data_schema=_form(_token_schema()),
             errors=errors,
         )
 
@@ -290,12 +302,12 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_reauth(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
         if user_input is not None and entry:
@@ -317,7 +329,7 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=_token_schema(),
+            data_schema=_form(_token_schema()),
             errors=errors,
         )
 
@@ -327,7 +339,7 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_setup_options(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """Collect poll intervals and feature flags during initial setup.
 
         Stores them directly into entry.options so the Options flow can
@@ -341,7 +353,7 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         return self.async_show_form(
             step_id="setup_options",
-            data_schema=_options_schema(),
+            data_schema=_form(_options_schema()),
         )
 
     # ------------------------------------------------------------------ #
@@ -350,7 +362,7 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """Reconfigure connection settings (URL, SSL, token).
 
         The token field is pre-populated with the existing token (masked).
@@ -396,21 +408,21 @@ class DockhandConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         defaults = entry.data if entry else {}
         return self.async_show_form(
             step_id="reconfigure",
-            data_schema=_reconfigure_schema(defaults),
+            data_schema=_form(_reconfigure_schema(defaults)),
             errors=errors,
         )
 
 
 class DockhandOptionsFlow(config_entries.OptionsFlow):
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    def __init__(self, config_entry: DockhandConfigEntry) -> None:
         self._entry = config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
-        defaults = {**self._entry.data, **self._entry.options}
+        defaults = dict(self._entry.options)
         return self.async_show_form(
-            step_id="init", data_schema=_options_schema(defaults)
+            step_id="init", data_schema=_form(_options_schema(defaults))
         )

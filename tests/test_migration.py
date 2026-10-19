@@ -527,13 +527,13 @@ def test_container_stats_option_turned_on_when_stat_entity_enabled(
     entry = _make_entry(hass)
     _add_entity(hass, entry, f"{ENTRY_ID}_1_container_web_cpu_percent")
     migrate_1_8_0_container_stats_option(hass, entry)
-    assert entry.options.get("enable_container_stats") is True
+    assert entry.options.get("enable_resource_stats") is True
 
 
 def test_container_stats_option_untouched_when_nothing_enabled(hass: HomeAssistant):
     entry = _make_entry(hass)
     migrate_1_8_0_container_stats_option(hass, entry)
-    assert "enable_container_stats" not in entry.options
+    assert "enable_resource_stats" not in entry.options
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +620,7 @@ def test_container_stats_option_ignores_disabled_entities(hass: HomeAssistant):
         ent.entity_id, disabled_by=er.RegistryEntryDisabler.INTEGRATION
     )
     migrate_1_8_0_container_stats_option(hass, entry)
-    assert "enable_container_stats" not in entry.options
+    assert "enable_resource_stats" not in entry.options
 
 
 def test_container_stats_option_respects_explicit_false(hass: HomeAssistant):
@@ -629,11 +629,11 @@ def test_container_stats_option_respects_explicit_false(hass: HomeAssistant):
     absent from options."""
     entry = _make_entry(hass)
     hass.config_entries.async_update_entry(
-        entry, options={**entry.options, "enable_container_stats": False}
+        entry, options={**entry.options, "enable_resource_stats": False}
     )
     _add_entity(hass, entry, f"{ENTRY_ID}_1_container_web_cpu_percent")
     migrate_1_8_0_container_stats_option(hass, entry)
-    assert entry.options.get("enable_container_stats") is False
+    assert entry.options.get("enable_resource_stats") is False
 
 
 def test_container_stats_option_ignores_unrelated_entity(hass: HomeAssistant):
@@ -642,7 +642,7 @@ def test_container_stats_option_ignores_unrelated_entity(hass: HomeAssistant):
     entry = _make_entry(hass)
     _add_entity(hass, entry, f"{ENTRY_ID}_1_container_web_state")
     migrate_1_8_0_container_stats_option(hass, entry)
-    assert "enable_container_stats" not in entry.options
+    assert "enable_resource_stats" not in entry.options
 
 
 # ---------------------------------------------------------------------------
@@ -807,3 +807,74 @@ def test_1_9_0_skips_device_for_different_domain(hass: HomeAssistant):
     idents = _get_device_identifiers(hass, dev.id)
     assert ("other_domain", "env_1") in idents
     assert (DOMAIN, f"{ENTRY_ID}_env_1") not in idents
+
+
+# ---------------------------------------------------------------------------
+# Identifiers the migrations can't map are left as they are
+# ---------------------------------------------------------------------------
+
+_UNKNOWN_HASH = "f" * 64
+
+
+def test_1_5_0_device_with_an_unknown_hash_is_left_alone(hass: HomeAssistant):
+    entry = _make_entry(hass)
+    dev = _add_device(hass, entry, f"container_1_{_UNKNOWN_HASH}")
+    migrate_1_5_0_container_device_identifiers(hass, ENTRY_ID, FAST_DATA_1_5)
+    assert (DOMAIN, f"container_1_{_UNKNOWN_HASH}") in _get_device_identifiers(
+        hass, dev.id
+    )
+
+
+def test_1_5_0_entity_with_an_unknown_hash_is_left_alone(hass: HomeAssistant):
+    entry = _make_entry(hass)
+    uid = f"dockhand_container_1_{_UNKNOWN_HASH}_state"
+    ent = _add_entity(hass, entry, uid)
+    other = _add_entity(hass, entry, "dockhand_env_1_cpu")
+    migrate_1_5_0_container_device_identifiers(hass, ENTRY_ID, FAST_DATA_1_5)
+    assert _get_uid(hass, ent.entity_id) == uid
+    assert _get_uid(hass, other.entity_id) == "dockhand_env_1_cpu"
+
+
+@pytest.mark.parametrize(
+    "uid",
+    [
+        "dockhand_env_1",  # no suffix
+        "dockhand_env_x_cpu",  # environment isn't a number
+        "dockhand_image",  # no environment
+        "dockhand_image_x_abc",  # environment isn't a number
+    ],
+)
+def test_1_7_3_malformed_unique_ids_are_left_alone(hass: HomeAssistant, uid):
+    entry = _make_entry(hass)
+    ent = _add_entity(hass, entry, uid)
+    migrate_1_7_3_entry_scoped_unique_ids(hass, ENTRY_ID)
+    assert _get_uid(hass, ent.entity_id) == uid
+
+
+# ---------------------------------------------------------------------------
+# Registry migrations follow the config schema rules
+# ---------------------------------------------------------------------------
+
+
+def test_no_retired_registry_migrations_left_in_the_code():
+    """A migration for registries left by releases two or more config
+    schema majors back can never run on anything again (such entries are
+    refused at setup) — delete it from REGISTRY_MIGRATIONS when this fails."""
+    from custom_components.dockhand.const import SCHEMA_VERSION
+    from custom_components.dockhand.migration import REGISTRY_MIGRATIONS
+
+    dead = [m.release for m in REGISTRY_MIGRATIONS if m.from_major < SCHEMA_VERSION - 1]
+    assert dead == []
+
+
+def test_registry_migration_lifecycle():
+    from custom_components.dockhand.migration import (
+        REGISTRY_MIGRATIONS,
+        registry_migrations_to_run,
+    )
+
+    assert registry_migrations_to_run() == list(REGISTRY_MIGRATIONS)
+    # At the next schema major, schema 1 installs can't be set up any more,
+    # so only the migrations from schema 2 releases still run.
+    assert [m.release for m in registry_migrations_to_run(3)] == ["1.9.0"]
+    assert registry_migrations_to_run(4) == []

@@ -1,8 +1,10 @@
+from dataclasses import dataclass
+
 DOMAIN = "dockhand"
 
 CONF_API_URL = "api_url"
 CONF_API_TOKEN = "api_token"
-CONF_POLL_INTERVAL = "poll_interval"
+CONF_POLL_INTERVAL_FAST = "poll_interval_fast"
 CONF_POLL_INTERVAL_SLOW = "poll_interval_slow"
 CONF_ENABLE_SCHEDULES = "enable_schedules"
 CONF_ENABLE_IMAGES = "enable_images"
@@ -10,10 +12,26 @@ CONF_ENABLE_VOLUMES = "enable_volumes"
 CONF_ENABLE_NETWORKS = "enable_networks"
 CONF_ENABLE_UPDATE_ENTITIES = "enable_update_entities"
 CONF_ENABLE_PRECISE_UPDATES = "enable_precise_updates"
-CONF_POLL_INTERVAL_UPDATES = "poll_interval_updates"
+CONF_POLL_INTERVAL_PRECISE_UPDATES = "poll_interval_precise_updates"
 CONF_ENABLE_RUNTIME_CONTROLS = "enable_runtime_controls"
-CONF_ENABLE_CONTAINER_STATS = "enable_container_stats"
+CONF_ENABLE_RESOURCE_STATS = "enable_resource_stats"
 CONF_VERIFY_SSL = "verify_ssl"
+
+# Everything the Configure dialog sets. These live in entry.options; entry.data
+# holds only the connection details (URL, token, SSL verification).
+OPTION_KEYS = (
+    CONF_POLL_INTERVAL_FAST,
+    CONF_POLL_INTERVAL_SLOW,
+    CONF_ENABLE_SCHEDULES,
+    CONF_ENABLE_IMAGES,
+    CONF_ENABLE_VOLUMES,
+    CONF_ENABLE_NETWORKS,
+    CONF_ENABLE_UPDATE_ENTITIES,
+    CONF_ENABLE_PRECISE_UPDATES,
+    CONF_POLL_INTERVAL_PRECISE_UPDATES,
+    CONF_ENABLE_RUNTIME_CONTROLS,
+    CONF_ENABLE_RESOURCE_STATS,
+)
 
 # Removed in 1.2.0 (breaking change) — session-cookie auth replaced by API tokens.
 # Kept as constants only so __init__.py can detect and migrate legacy config entries.
@@ -21,24 +39,84 @@ _LEGACY_CONF_USERNAME = "username"
 _LEGACY_CONF_PASSWORD = "password"
 _LEGACY_CONF_SESSION_COOKIE = "session_cookie"
 
-# Renamed in 1.8.0: the old name ("enable updates") was misleading once update
-# entities became always-on (Tier 1) — this option only ever controlled Tier 2
-# (precise digest versions via real registry queries) even before the rename.
-# Kept as a constant only so __init__.py's async_migrate_entry can carry an
-# existing user's stored value over to the new key (config entry VERSION 1 -> 2).
-_LEGACY_CONF_ENABLE_UPDATES = "enable_updates"
+# Config entry schema version, (major, minor). Bump the minor for any change
+# to stored settings; bump the major only in a major integration release (see
+# docs/ARCHITECTURE.md §4 for the full lifecycle this drives).
+SCHEMA_VERSION = 2
+SCHEMA_MINOR_VERSION = 2
 
-DEFAULT_POLL_INTERVAL = 60
+
+@dataclass(frozen=True)
+class RenamedOption:
+    """A stored setting renamed at schema version (major, minor).
+
+    How long each rename is kept working follows from (major, minor) alone,
+    so nothing here has to be retired by hand at the right moment:
+      - Downgrade support (stored config): only while (major, minor) is the
+        current schema version is the old name saved alongside the new one,
+        for releases on the schema version just before it, which read only
+        the old name. The next schema bump, minor or major, stops this, and
+        the copies left in stored entries are cleaned up by the same pass
+        that wrote them. So stored entries never carry more than one schema
+        version's worth of old names. (Not in a major's first minor: no
+        release of the previous major can load the entry at all.)
+      - Upgrade support (code only): while `major` is the current or the
+        previous schema major, an entry still using the old name is
+        translated on upgrade, however many releases it skipped. Older than
+        that, the entry can't be migrated at all (see async_migrate_entry),
+        so the rename is dead code — tests/test_init.py fails until it's
+        deleted from RENAMED_OPTIONS.
+    """
+
+    old: str
+    new: str
+    major: int
+    minor: int
+
+
+RENAMED_OPTIONS: tuple[RenamedOption, ...] = (
+    # 1.8.0: only ever controlled the precise (Tier 2) update checks, once
+    # update entities themselves became always-on.
+    RenamedOption("enable_updates", "enable_precise_updates", 2, 1),
+    # 1.11.0: now also creates the stack resource stats sensors.
+    RenamedOption("enable_container_stats", "enable_resource_stats", 2, 2),
+    # 1.11.0: pairs with poll_interval_slow; alone it read as the only interval.
+    RenamedOption("poll_interval", "poll_interval_fast", 2, 2),
+    # 1.11.0: only ever controlled the precise (Tier 2) registry checks.
+    RenamedOption("poll_interval_updates", "poll_interval_precise_updates", 2, 2),
+)
+
+
+SCHEMA = (SCHEMA_VERSION, SCHEMA_MINOR_VERSION)
+
+
+def renames_to_translate(schema: tuple[int, int] = SCHEMA) -> dict[str, str]:
+    """old -> new for every rename an upgrade still has to translate."""
+    return {r.old: r.new for r in RENAMED_OPTIONS if r.major >= schema[0] - 1}
+
+
+def renames_to_mirror(schema: tuple[int, int] = SCHEMA) -> dict[str, str]:
+    """old -> new for every rename whose old name is still saved too: those
+    made at exactly this schema version, for releases on the one before it
+    (which can still load the entry, and read only the old name)."""
+    return {
+        r.old: r.new
+        for r in RENAMED_OPTIONS
+        if (r.major, r.minor) == schema and r.minor > 1
+    }
+
+
+DEFAULT_POLL_INTERVAL_FAST = 60
 DEFAULT_POLL_INTERVAL_SLOW = 600
-DEFAULT_POLL_INTERVAL_UPDATES = 86400  # 24 hours
+DEFAULT_POLL_INTERVAL_PRECISE_UPDATES = 86400  # 24 hours
 
 # Floors for the options-flow interval fields. These exist to reject zero and
 # negative values, which would make DataUpdateCoordinator refresh in a tight
 # loop and hammer the Dockhand API. The update floor is higher because each
 # check performs real registry queries for every container.
-MIN_POLL_INTERVAL = 10
+MIN_POLL_INTERVAL_FAST = 10
 MIN_POLL_INTERVAL_SLOW = 30
-MIN_POLL_INTERVAL_UPDATES = 300
+MIN_POLL_INTERVAL_PRECISE_UPDATES = 300
 DEFAULT_ENABLE_SCHEDULES = False
 DEFAULT_ENABLE_IMAGES = False
 DEFAULT_ENABLE_VOLUMES = False
@@ -48,8 +126,8 @@ DEFAULT_ENABLE_NETWORKS = False
 # with no way to opt out (github.com/raetha/ha-dockhand/issues/23) — this
 # is the option that was missing, not a replacement for
 # CONF_ENABLE_PRECISE_UPDATES (which only ever controlled Tier 2 and
-# still does; see the 1.8.0 rename comment on _LEGACY_CONF_ENABLE_UPDATES
-# above for that history). This one gates the update platform itself —
+# still does; its 1.8.0 rename is in RENAMED_OPTIONS above). This one
+# gates the update platform itself —
 # Tier 1 and Tier 2 both — off entirely.
 DEFAULT_ENABLE_UPDATE_ENTITIES = True
 DEFAULT_ENABLE_PRECISE_UPDATES = False
@@ -58,7 +136,7 @@ DEFAULT_ENABLE_PRECISE_UPDATES = False
 # unlike other DIAGNOSTIC entities, this has a real, non-trivial API cost,
 # so it's gated the same way images/networks/volumes are.
 DEFAULT_ENABLE_RUNTIME_CONTROLS = False
-DEFAULT_ENABLE_CONTAINER_STATS = False
+DEFAULT_ENABLE_RESOURCE_STATS = False
 
 PLATFORMS = [
     "sensor",

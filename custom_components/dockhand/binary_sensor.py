@@ -1,12 +1,14 @@
-from typing import Any
+from typing import Any, override
 
-from homeassistant.components.binary_sensor import (
+# Home Assistant 2026.10 moved the class to binary_sensor.const, which the
+# minimum supported version doesn't have; the package still re-exports it.
+from homeassistant.components.binary_sensor import (  # type: ignore[attr-defined, unused-ignore]
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -17,6 +19,7 @@ from .helpers import (
     _all_envs,
     _coordinator_env,
     _env_device,
+    _find_git_stack,
     _find_stack,
     _stack_device,
     already_registered,
@@ -158,6 +161,7 @@ class BaseEnvBinarySensor(
         return _coordinator_env(self.coordinator.data, self._env_id).get("stats") or {}
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         stats = self._stats()
         env_name = stats.get("name", f"Environment {self._env_id}")
@@ -188,6 +192,7 @@ class DockhandEnvOnlineSensor(BaseEnvBinarySensor):
         self._attr_unique_id = f"{entry_id}_{env_id}_online"
 
     @property
+    @override
     def is_on(self) -> bool:
         return bool(self._stats().get("online", False))
 
@@ -197,6 +202,7 @@ class DockhandEnvOnlineSensor(BaseEnvBinarySensor):
         return env.get("env_meta") or {}
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any]:
         meta = self._env_meta()
         labels = self._stats().get("labels")
@@ -224,6 +230,7 @@ class DockhandEnvCollectActivitySensor(BaseEnvBinarySensor):
         self._attr_unique_id = f"{entry_id}_{env_id}_collect_activity"
 
     @property
+    @override
     def is_on(self) -> bool | None:
         v = self._stats().get("collectActivity")
         return bool(v) if v is not None else None
@@ -245,6 +252,7 @@ class DockhandEnvCollectMetricsSensor(BaseEnvBinarySensor):
         self._attr_unique_id = f"{entry_id}_{env_id}_collect_metrics"
 
     @property
+    @override
     def is_on(self) -> bool | None:
         v = self._stats().get("collectMetrics")
         return bool(v) if v is not None else None
@@ -266,6 +274,7 @@ class DockhandEnvScannerEnabledSensor(BaseEnvBinarySensor):
         self._attr_unique_id = f"{entry_id}_{env_id}_scanner_enabled"
 
     @property
+    @override
     def is_on(self) -> bool | None:
         v = self._stats().get("scannerEnabled")
         return bool(v) if v is not None else None
@@ -287,6 +296,7 @@ class DockhandEnvUpdateCheckSensor(BaseEnvBinarySensor):
         self._attr_unique_id = f"{entry_id}_{env_id}_update_check_enabled"
 
     @property
+    @override
     def is_on(self) -> bool | None:
         v = self._stats().get("updateCheckEnabled")
         return bool(v) if v is not None else None
@@ -308,6 +318,7 @@ class DockhandEnvAutoUpdateSensor(BaseEnvBinarySensor):
         self._attr_unique_id = f"{entry_id}_{env_id}_auto_update"
 
     @property
+    @override
     def is_on(self) -> bool | None:
         v = self._stats().get("updateCheckAutoUpdate")
         return bool(v) if v is not None else None
@@ -352,10 +363,12 @@ class DockhandEnvImagePruneBinarySensor(
         return env.get("env_meta") or {}
 
     @property
+    @override
     def is_on(self) -> bool | None:
         return bool(self._env_meta().get("imagePruneEnabled"))
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _env_device(self._entry_id, self._env_id, self._env_name, self._base_url)
 
@@ -424,6 +437,7 @@ class DockhandStackUpdatesAvailableBinarySensor(
         return _find_stack(self.coordinator.data, self._env_id, self._stack_name)
 
     @property
+    @override
     def is_on(self) -> bool | None:
         s = self._stack()
         if s is None or "updatesAvailable" not in s:
@@ -431,6 +445,7 @@ class DockhandStackUpdatesAvailableBinarySensor(
         return bool(s["updatesAvailable"])
 
     @property
+    @override
     def extra_state_attributes(self) -> dict[str, Any] | None:
         s = self._stack()
         if s is None or "updateCount" not in s:
@@ -461,6 +476,7 @@ class DockhandStackUpdatesAvailableBinarySensor(
         }
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         s = self._stack()
         return _stack_device(
@@ -507,25 +523,23 @@ class DockhandGitStackSyncErrorBinarySensor(
             f"{entry_id}_{env_id}_stack_{self._stack_name}_git_sync_error"
         )
 
-    def _git_stack(self) -> dict | None:
-        slow_data = self.coordinator.data or {}
-        env = _coordinator_env(slow_data, self._env_id)
-        for gs in env.get("git_stacks") or []:
-            if gs.get("stackName") == self._stack_name:
-                return gs
-        return None
+    def _git_stack(self) -> dict[str, Any] | None:
+        return _find_git_stack(self.coordinator.data, self._env_id, self._stack_name)
 
     @property
+    @override
     def is_on(self) -> bool | None:
         gs = self._git_stack()
         return gs.get("syncStatus") == "error" if gs else None
 
     @property
+    @override
     def extra_state_attributes(self) -> dict:
         gs = self._git_stack()
         return {"sync_error": gs.get("syncError")} if gs else {}
 
     @property
+    @override
     def device_info(self) -> DeviceInfo:
         return _stack_device(
             getattr(self, "hass", None),
